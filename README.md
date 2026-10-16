@@ -88,5 +88,5 @@ The output build will be placed inside `dist/main/`.
 
 ## Acknowledgments
 
-* Game archive unpacking and VROMF extraction powered by `wt_ext_cli.exe`.
-* 3D model parsing and texture extraction routines built on **Dagor Asset Explorer** backend logic.
+* Game archive unpacking and VROMF extraction powered by `wt_ext_cli.exe` - Warthunder-Open-Source-Foundation.
+* 3D model parsing and texture extraction routines built on **Dagor Asset Explorer** backend logic - quentin-dh.
