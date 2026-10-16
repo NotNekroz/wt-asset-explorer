@@ -24,6 +24,8 @@ A standalone desktop tool built with **PySide6** and **Dagor Asset Explorer** lo
 ```text
 ├── main.py                     # Entry point
 ├── gui.py                      # Main PySide6 UI window & thread bridge
+├── run.bat                     # Automatic launcher & environment setup
+├── requirements.txt            # Dependency specifications
 ├── wt_ext_cli.exe              # War Thunder VROMF unpacking utility backend
 ├── wtx/
 │   ├── assets.py               # Dagor Asset Explorer interface & indexer
@@ -31,3 +33,60 @@ A standalone desktop tool built with **PySide6** and **Dagor Asset Explorer** lo
 └── vehicle_core/
     ├── LoadoutSearch.py        # Weapon loadout extraction & resolution
     └── VehicleLook.py          # Path auto-detection & nation mapping
+```
+
+---
+
+## How to Run
+
+### Quick Start (Windows)
+
+1. Ensure [Python 3.10+](https://www.python.org/) is installed on your computer.
+2. Double-click **`run.bat`**.
+
+> **Note:** On first launch, `run.bat` creates a `.venv` folder, upgrades `pip`, installs `PySide6` from `requirements.txt`, and opens the tool automatically. Subsequent launches start instantly.
+
+---
+
+### Manual Setup
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/NotNekroz/wt-asset-explorer.git
+   cd wt-asset-explorer
+   ```
+
+2. **Create and activate a virtual environment:**
+   ```bash
+   python -m venv .venv
+   .venv\Scripts\activate
+   ```
+
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Launch the application:**
+   ```bash
+   python main.py
+   ```
+
+---
+
+## Building a Standalone Executable
+
+To compile the application into a standalone Windows executable using **PyInstaller**:
+
+```bash
+Work In Progress
+```
+
+The output build will be placed inside `dist/main/`.
+
+---
+
+## Acknowledgments
+
+* Game archive unpacking and VROMF extraction powered by `wt_ext_cli.exe`.
+* 3D model parsing and texture extraction routines built on **Dagor Asset Explorer** backend logic.

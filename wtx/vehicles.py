@@ -123,11 +123,24 @@ _MODEL_KEY_RE = re.compile(r'^\s*"?([A-Za-z0-9_]*model[A-Za-z0-9_]*)"?\s*:\s*t\s
 _VEHICLE_DIRS = ("flightmodels/", "tankmodels/", "tanks/", "helicopters/", "ships/")
 
 
+import sys  # Ensure sys is imported at the top of wtx/vehicles.py
+
+
 def find_wt_ext(root: Path) -> Path | None:
-    for cand in (root / "wt_ext_cli.exe", Path.cwd() / "wt_ext_cli.exe"):
-        if cand.is_file():
-            return cand
-    return None
+  # Check if running as a compiled PyInstaller EXE
+  if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    meipass_exe = Path(sys._MEIPASS) / "wt_ext_cli.exe"
+    if meipass_exe.is_file():
+      return meipass_exe
+
+  for cand in (
+      root / "wt_ext_cli.exe",
+      Path.cwd() / "wt_ext_cli.exe",
+      Path(__file__).parent / "wt_ext_cli.exe",
+  ):
+    if cand.is_file():
+      return cand
+  return None
 
 
 def looks_like_wt_dir(p: Path) -> bool:
