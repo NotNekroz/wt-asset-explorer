@@ -1,0 +1,36 @@
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# PyInstaller & Build Output
+build/
+dist/
+*.spec
+
+# War Thunder Caches & Local User Data
+.wt_asset_explorer/
+asset_index_*.json
+overrides.json
+gamedata_*/
+wt_veh_search_*/
+wt_weapon_search_*/
+
+# Export Outputs
+WT Exports/
+*.obj
+*.mtl
+*.dds
+
+# IDE & OS Files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
