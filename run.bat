@@ -1,13 +1,23 @@
 @echo off
 cd /d "%~dp0"
+
+if not exist "wt_ext_cli.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$ErrorActionPreference = 'Stop';" ^
+        "$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/latest';" ^
+        "$asset = $release.assets | Where-Object { $_.name -like '*win*' -or $_.name -like '*.exe' } | Select-Object -First 1;" ^
+        "if (-not $asset) { write-error 'No suitable executable asset found in latest release.'; exit 1; }" ^
+        "Invoke-WebRequest -Uri $asset.browser_download_url -OutFile 'wt_ext_cli.exe';" || goto :fail
+)
+
 if not exist ".venv\Scripts\python.exe" (
-    echo First run: creating a virtual environment and installing dependencies...
     py -3 -m venv .venv || goto :fail
     ".venv\Scripts\python.exe" -m pip install --upgrade pip
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt || goto :fail
 )
-".venv\Scripts\python.exe" main.py
-goto :eof
+
+start "" ".venv\Scripts\pythonw.exe" main.py
+exit /b 0
+
 :fail
-echo Setup failed. Make sure Python 3.10 - 3.12 is installed (python.org) and try again.
 pause

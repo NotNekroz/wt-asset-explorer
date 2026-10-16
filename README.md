@@ -55,19 +55,22 @@ A standalone desktop tool built with **PySide6** and **Dagor Asset Explorer** lo
    git clone https://github.com/NotNekroz/wt-asset-explorer.git
    cd wt-asset-explorer
    ```
-
-2. **Create and activate a virtual environment:**
+2. **Download latest binary of wt_ext_cli:**
+   ```bash
+   https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/latest
+   ```
+3. **Create and activate a virtual environment:**
    ```bash
    python -m venv .venv
    .venv\Scripts\activate
    ```
 
-3. **Install dependencies:**
+4. **Install dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
 
-4. **Launch the application:**
+5. **Launch the application:**
    ```bash
    python main.py
    ```

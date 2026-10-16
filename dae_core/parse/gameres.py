@@ -439,3 +439,22 @@ class GameResourcePackBuilder:
 	@property
 	def name(self):
 		return self.__name
+def getDetailedOffsetMap(self) -> dict[str, dict]:
+    """Returns a dict mapping asset names to their raw grp byte offsets and sizes."""
+    mapping = {}
+    res_cnt = len(self.__realResEntries)
+    for i, entry in enumerate(self.__realResEntries):
+        name = entry.getName()
+        offset = entry._RealResEntry__offset
+        if i + 1 < res_cnt:
+            next_offset = self.__realResEntries[i + 1]._RealResEntry__offset
+            size = next_offset - offset
+        else:
+            size = self.size - offset
+        mapping[name.lower()] = {
+            "name": name,
+            "class_id": entry.getClassId(),
+            "offset": offset,
+            "size": size
+        }
+    return mapping

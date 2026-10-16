@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from pathlib import Path
 import re
 import sys
@@ -968,8 +969,20 @@ def _dark_fallback(app: QApplication):
 
 
 def run() -> int:
+  try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "WTAssetExplorer.WTAssetExplorer.1"
+    )
+  except Exception:
+    pass
+
   app = QApplication(sys.argv)
   app.setApplicationName(APP_NAME)
+
+  icon_path = ROOT / "res" / "icon.ico"
+  if icon_path.exists():
+    app.setWindowIcon(QIcon(str(icon_path)))
+
   try:
     app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
     if app.style().objectName().lower() != "windows11":

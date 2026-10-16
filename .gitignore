@@ -34,3 +34,6 @@ WT Exports/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Exclude wt_ext_cli.exe
+wt_ext_cli.exe

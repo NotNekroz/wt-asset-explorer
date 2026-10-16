@@ -3,7 +3,7 @@
 What the DAE GUI does by hand ("open asset folder", pick a .grp, right-click -> Export to OBJ) is done here
 in code:
 
-  1. index        - read the header of every .grp (entry names + class ids) and every .dxp.bin (texture
+  1. index        - read the header of every .grp (entry names + class ids + byte offsets) and every .dxp.bin (texture
                     names) once, and cache the result, so a vehicle can be found by name instantly
   2. resolve      - vehicle / weapon  ->  the DynModel (or RendInst) entry that holds its 3D model
   3. export       - load that .grp, make its skeleton / collision visible to the model, load only the
@@ -21,7 +21,7 @@ from typing import Callable
 import util.log as log
 from parse.gameres import GameResDesc, GameResourcePack
 from parse.material import DDSx, DDSxTexturePack2
-from parse.realres import CollisionGeom, DynModel, GeomNodeTree, RendInst
+from parse.realres import CollisionGeom, DynModel, GeomNodeTree, REALRES_CLASSES_DICT, RendInst
 from util.assetcacher import AssetCacher
 
 Status = Callable[[str], None]
@@ -31,7 +31,7 @@ DYNMODEL_ID = DynModel.staticClassId
 RENDINST_ID = RendInst.staticClassId
 MODEL_CLASS_IDS = {DYNMODEL_ID, RENDINST_ID}
 _CACHED_TYPES = (GeomNodeTree, CollisionGeom, DynModel, RendInst)  # same set DAE keeps in AssetCacher
-INDEX_VERSION = 3
+INDEX_VERSION = 4  # Bumped to support raw byte offset caching
 
 
 def _clean_tex_name(s: str) -> str:
@@ -72,11 +72,33 @@ def _stem(grp_rel: str) -> str:
     return s[:-3] if s.endswith("-hq") else s
 
 
+def _extract_grp_offsets(grp_pack: GameResourcePack) -> list[dict]:
+    """Extracts entry metadata including exact byte offset and size for instant seek lookups."""
+    res_cnt = grp_pack.getRealResEntryCnt()
+    entries = []
+    for i in range(res_cnt):
+        entry = grp_pack.getRealResEntry(i)
+        offset = entry._RealResEntry__offset
+        if i + 1 < res_cnt:
+            next_offset = grp_pack.getRealResEntry(i + 1)._RealResEntry__offset
+            size = next_offset - offset
+        else:
+            size = grp_pack.size - offset
+
+        entries.append({
+            "name": entry.getName(),
+            "class_id": entry.getClassId(),
+            "offset": offset,
+            "size": size
+        })
+    return entries
+
+
 class AssetLibrary:
     def __init__(self, game_dir: Path, cache_dir: Path):
         self.game_dir = Path(game_dir)
         self.cache_dir = Path(cache_dir)
-        self.grp_entries: dict[str, list[list]] = {}       # grp rel -> [[name, classId], ...]
+        self.grp_entries: dict[str, list[dict]] = {}       # grp rel -> [{"name": str, "class_id": int, "offset": int, "size": int}, ...]
         self.dxp_names: dict[str, list[str]] = {}          # dxp rel -> [texture names]
         self.desc_files: list[str] = []                    # rel paths of *Desc.bin
         self.name_index: dict[str, list[tuple[str, str, int]]] = {}   # lower name -> [(name, grp, classId)]
@@ -149,7 +171,8 @@ class AssetLibrary:
                     reused += 1
                 else:
                     try:
-                        entries = [[n, c] for n, c in GameResourcePack(str(p)).getEntryList()]
+                        pack = GameResourcePack(str(p))
+                        entries = _extract_grp_offsets(pack)
                     except Exception:
                         entries, failed = [], failed + 1
                     new_grps[rel] = {"sig": sig, "entries": entries}
@@ -195,7 +218,12 @@ class AssetLibrary:
         self.name_index.clear()
         self.tex_index.clear()
         for grp, entries in self.grp_entries.items():
-            for name, cid in entries:
+            for item in entries:
+                # Support structure compatibility
+                if isinstance(item, dict):
+                    name, cid = item["name"], item["class_id"]
+                else:
+                    name, cid = item[0], item[1]
                 self.name_index.setdefault(name.lower(), []).append((name, grp, cid))
         for dxp, names in self.dxp_names.items():
             for n in names:
@@ -246,7 +274,12 @@ class AssetLibrary:
                 for grp, entries in self.grp_entries.items():
                     gs = _stem(grp)
                     if gs == s or gs.endswith("_" + s):
-                        models = [(n, c) for n, c in entries if c in MODEL_CLASS_IDS]
+                        models = []
+                        for item in entries:
+                            name = item["name"] if isinstance(item, dict) else item[0]
+                            cid = item["class_id"] if isinstance(item, dict) else item[1]
+                            if cid in MODEL_CLASS_IDS:
+                                models.append((name, cid))
                         models.sort(key=lambda e: (
                             0 if "content.hq" in grp.lower() else 1,
                             not e[0].lower().endswith("_dynmodel"),
@@ -419,10 +452,7 @@ class AssetLibrary:
             raise FileNotFoundError(f"GRP file not found: {grp_path}")
 
         self._ensure_descs(ref.grp, status)
-
         status(f"Loading {ref.grp_file} ...")
-        pack = GameResourcePack(str(grp_path))
-        assets = pack.getPackedFiles()
 
         for cls in _CACHED_TYPES:
             AssetCacher.clearCache(cls)
@@ -430,26 +460,71 @@ class AssetLibrary:
         target = None
         ref_name_lower = ref.name.lower()
 
-        for a in assets:
-            if type(a) in _CACHED_TYPES:
-                AssetCacher.cacheAsset(a)
-            a_name = getattr(a, "name", None) or getattr(a, "resName", None)
-            if a_name and str(a_name).lower() == ref_name_lower:
-                target = a
+        # --- FAST-PATH: Offset cache lookup with Skeleton / Collision Caching ---
+        entries = self.grp_entries.get(ref.grp, [])
+        cached_meta = None
 
+        for item in entries:
+            item_name = item["name"] if isinstance(item, dict) else item[0]
+            item_cid = item["class_id"] if isinstance(item, dict) else item[1]
+
+            # Ensure GeomNodeTree, CollisionGeom, etc. inside this .grp are cached for model computation
+            if item_cid in REALRES_CLASSES_DICT:
+                cls_type = REALRES_CLASSES_DICT[item_cid]
+                if cls_type in _CACHED_TYPES:
+                    try:
+                        res_obj = cls_type(
+                            filePath=str(grp_path),
+                            name=item_name,
+                            size=item["size"] if isinstance(item, dict) else 0,
+                            offset=item["offset"] if isinstance(item, dict) else 0
+                        )
+                        AssetCacher.cacheAsset(res_obj)
+                    except Exception:
+                        pass
+
+            if item_name.lower() == ref_name_lower:
+                cached_meta = item
+
+        if cached_meta:
+            cid = cached_meta["class_id"] if isinstance(cached_meta, dict) else cached_meta[1]
+            if cid in REALRES_CLASSES_DICT:
+                try:
+                    cls_type = REALRES_CLASSES_DICT[cid]
+                    target = cls_type(
+                        filePath=str(grp_path),
+                        name=cached_meta["name"] if isinstance(cached_meta, dict) else cached_meta[0],
+                        size=cached_meta["size"] if isinstance(cached_meta, dict) else 0,
+                        offset=cached_meta["offset"] if isinstance(cached_meta, dict) else 0
+                    )
+                except Exception:
+                    target = None
+
+        # --- FALLBACK: Direct .grp container scanning ---
         if target is None:
+            pack = GameResourcePack(str(grp_path))
+            assets = pack.getPackedFiles()
+
             for a in assets:
+                if type(a) in _CACHED_TYPES:
+                    AssetCacher.cacheAsset(a)
                 a_name = getattr(a, "name", None) or getattr(a, "resName", None)
-                if a_name and (ref_name_lower in str(a_name).lower() or str(a_name).lower() in ref_name_lower):
+                if a_name and str(a_name).lower() == ref_name_lower:
                     target = a
-                    break
 
-        if target is None:
-            models_in_grp = [a for a in assets if isinstance(a, (DynModel, RendInst))]
-            if len(models_in_grp) == 1:
-                target = models_in_grp[0]
-            else:
-                raise LookupError(f"'{ref.name}' is not a model in {ref.grp_file}")
+            if target is None:
+                for a in assets:
+                    a_name = getattr(a, "name", None) or getattr(a, "resName", None)
+                    if a_name and (ref_name_lower in str(a_name).lower() or str(a_name).lower() in ref_name_lower):
+                        target = a
+                        break
+
+            if target is None:
+                models_in_grp = [a for a in assets if isinstance(a, (DynModel, RendInst))]
+                if len(models_in_grp) == 1:
+                    target = models_in_grp[0]
+                else:
+                    raise LookupError(f"'{ref.name}' is not a model in {ref.grp_file}")
 
         status(f"Reading {target.__class__.__name__} '{getattr(target, 'name', ref.name)}' ...")
         target.computeData()
