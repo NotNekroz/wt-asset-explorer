@@ -1095,6 +1095,9 @@ class Model(Terminable):
 			file.close()
 
 			if exportTexture:
+				# First run model-level texture extraction to catch all t0/t1/t2/camo slots
+				self.exportTextures(output, exportTexture=True, forceConvert=forceConvert)
+				# Then trigger mtl export routines (like baking/conversions)
 				mtl.exportTextures(output, forceConvert)
 
 			log.subLevel()
@@ -2180,8 +2183,9 @@ class DynModel(RendInst):
 			log.addLevel()
 			shaderMeshElems:tuple[ShaderMesh.Elem] = skinnedMesh.mesh[i].elems
 			
-			
-			vOfs = self._computeMvdShaderMesh(mvd, shaderMeshElems, mdl, obj, vertexDatas, {}, vOfs)
+			# Ensure a clean vertex offset pass per skinned element dictionary
+			vertexOrder:dict[int, list[ShaderMesh.Elem]] = {}
+			vOfs = self._computeMvdShaderMesh(mvd, shaderMeshElems, mdl, obj, vertexDatas, vertexOrder, vOfs)
 
 			log.subLevel()
 

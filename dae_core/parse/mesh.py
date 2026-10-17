@@ -559,7 +559,7 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 				28:(FLOAT_VERTEX(), PADDING(4), FLOAT_UV(), PADDING(4)),
 			  },
 			5:{
-				24:(SHORT_UV(), SHORT_VERTEX(), PADDING(14)),
+				24:(PADDING(4), SHORT_VERTEX(), PADDING(6), DUAL_SHORT_UV()),
 				28:(FLOAT_VERTEX(), PADDING(12), SHORT_UV()),
 				36:(FLOAT_VERTEX(), PADDING(4), FLOAT_UV(), PADDING(12))
 			  },
@@ -604,41 +604,42 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 				return None
 
 		def __processVertices__(self, file:BinBlock):
-			format = self.__gvData.getStorageFormat()
-			vStride = self.__gvData.getVertexStride()
-			vCnt = self.__gvData.getVertexCnt()
+				format = self.__gvData.getStorageFormat()
+				vStride = self.__gvData.getVertexStride()
+				vCnt = self.__gvData.getVertexCnt()
 
-			verts:list[list[float, float, float]] = [None] * vCnt
-			UVs0:list[list[float, float]] = [None] * vCnt
-			UVs1:list[list[float, float]] = [None] * vCnt
+				verts:list[list[float, float, float]] = [None] * vCnt
+				UVs0:list[list[float, float]] = [None] * vCnt
+				UVs1:list[list[float, float]] = [None] * vCnt
 
-			parser = self.getParser(format, vStride)
+				parser = self.getParser(format, vStride)
 
-			if parser is None:
-				raise Exception(f"Unimplemented storage format {format}-{vStride}")
-			else:
-				log.log(f"Processing {vCnt} vertices vFormat={format} vStride={vStride}")
+				if parser is None:
+					raise Exception(f"Unimplemented storage format {format}-{vStride}")
+				else:
+					log.log(f"Processing {vCnt} vertices vFormat={format} vStride={vStride}")
 
-				for i in SafeRange(self, vCnt):
-					for parseClass in SafeIter(self, parser):
-						parseClass:MatVData.VertexData.PARSECLASS
+					for i in SafeRange(self, vCnt):
+						for parseClass in SafeIter(self, parser):
+							parseClass:MatVData.VertexData.PARSECLASS
 
-						if isinstance(parseClass, MatVData.VertexData.PADDING):
-							parseClass.read(file)
-						elif isinstance(parseClass, MatVData.VertexData.VERTEX):
-							verts[i] = parseClass.read(file)
-						elif isinstance(parseClass, MatVData.VertexData.UV):
-							res = parseClass.read(file)
-							if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], tuple):
-								UVs0[i] = res[0]
-								UVs1[i] = res[1]
-							else:
-								UVs0[i] = res
-								UVs1[i] = res
+							if isinstance(parseClass, MatVData.VertexData.PADDING):
+								parseClass.read(file)
+							elif isinstance(parseClass, MatVData.VertexData.VERTEX):
+								verts[i] = parseClass.read(file)
+							elif isinstance(parseClass, MatVData.VertexData.UV):
+								res = parseClass.read(file)
+								if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], tuple):
+									UVs0[i] = res[0]
+									UVs1[i] = res[1]
+								else:
+									# Only assign single streams to UVs0, leaving UVs1 unassigned 
+									# to prevent fallback duplication from overriding the base unwrap
+									UVs0[i] = res
 
-			self.__verts = verts
-			self.__UVs = UVs0
-			self.__UVs1 = UVs1
+				self.__verts = verts
+				self.__UVs = UVs0
+				self.__UVs1 = UVs1
 			
 		def __processFaces__(self, file:BinBlock):
 			if self.__unimplemented:
@@ -684,7 +685,7 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			return self.__faces
 
 		def getObj(self):
-			verts, UVs0, UVs1, faces = self.__verts, self.__UVs, getattr(self, '_VertexData__UVs1', None), self.__faces
+			verts, UVs0, faces = self.__verts, self.__UVs, self.__faces
 
 			if not verts:
 				raise NotImplementedError("Can't get an obj out of an unimplemented model format")
@@ -701,10 +702,7 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			for v in SafeIter(self, UVs0):
 				obj += f"vt {v[0]:.4f} {v[1]:.4f}\n"
 
-			if UVs1 and any(UVs1):
-				log.log(f"Exporting {len(UVs1)} UVs (Channel 1)")
-				for v in SafeIter(self, UVs1):
-					obj += f"vt {v[0]:.4f} {v[1]:.4f}\n"
+			# Omit UVs1 entirely so it doesn't corrupt the .obj texture coordinate indices
 
 			log.log(f"Exporting {len(faces)} faces")
 			

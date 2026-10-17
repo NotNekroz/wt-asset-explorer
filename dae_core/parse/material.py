@@ -1112,28 +1112,61 @@ class MaterialTemplateLibrary(Terminable):
 
 		return mtl
 	
-	def exportTextures(self, outpath:str = getcwd(), forceConvert:bool = False):
-		log.log("Exporting MTL textures and auto-baking camouflage over base textures")
+	def exportTextures(self, outpath: str = getcwd(), forceConvert: bool = False):
+		log.log("Exporting MTL textures")
 		log.addLevel()
 
+		has_dynamic_camo = False
+
 		for mat in SafeIter(self, self.__mats):
-			mat:MaterialTemplateLibrary.Material
+			mat: MaterialTemplateLibrary.Material
 
 			log.log(f"Exporting textures from {mat.material.getName()}")
 			log.addLevel()
 
 			mat.exportTextures(outpath, forceConvert)
 
+			# Gate execution: Enable dynamic camo baking for ground vehicles, tanks, and ships
+			cls_name = str(mat.material.cls).lower()
+			if any(k in cls_name for k in ("tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted")):
+				if not any(excluded in cls_name for excluded in ("aircraft", "cockpit", "building")):
+					has_dynamic_camo = True
+
 			log.subLevel()
 
-		# Automatically execute the bake process and overwrite the original _c.dds textures
+		# Skip dynamic camo baking if model does not use dynamic camo
+		if not has_dynamic_camo:
+			log.log("Model does not use dynamic camo; skipping camouflage baking step.")
+			log.subLevel()
+			return
+
+		# Build a mapping of diffuse texture to its paired camo texture from material parameters
+		diffuse_to_camo = {}
+		for mat in SafeIter(self, self.__mats):
+			params = mat.material.getParams()
+			t0 = params.get("t0") or mat.material.diffuse
+			t1 = params.get("t1") or params.get("camo_tex")
+			if not t1:
+				for s in mat.material.getTextureSlots()[1:]:
+					if s and "camo" in str(s).lower():
+						t1 = s
+						break
+			if t0 and t1:
+				t0_clean = str(t0).split("*")[0].lower()
+				t1_clean = str(t1).split("*")[0].lower()
+				if not t0_clean.endswith(".dds"):
+					t0_clean += ".dds"
+				if not t1_clean.endswith(".dds"):
+					t1_clean += ".dds"
+				diffuse_to_camo[t0_clean] = t1_clean
+
 		textures_dir = path.join(outpath, "textures")
 		if path.exists(textures_dir):
 			try:
 				camo_files = [f for f in os.listdir(textures_dir) if "camo" in f.lower() and f.lower().endswith('.dds')]
 				
 				if camo_files:
-					from PIL import Image
+					from PIL import Image, ImageChops
 					import subprocess
 					from util.misc import ROOT_FOLDER
 					
@@ -1141,52 +1174,80 @@ class MaterialTemplateLibrary(Terminable):
 					if not path.exists(texconv_path):
 						texconv_path = "texconv.exe"
 
-					camo_dds = path.join(textures_dir, camo_files[0])
-					
-					subprocess.run([texconv_path, "-y", "-ft", "png", "-o", textures_dir, camo_dds], stdout=subprocess.DEVNULL)
-					camo_png = path.splitext(camo_dds)[0] + ".png"
-					camo_img = Image.open(camo_png).convert("RGB")
-
-					base_textures = [f for f in os.listdir(textures_dir) if f.endswith('_c.dds')]
+					# Target base diffuse textures that have camo definitions, or all _c.dds if no explicit mapping
+					if diffuse_to_camo:
+						base_textures = [f for f in os.listdir(textures_dir) if f.lower() in diffuse_to_camo]
+					else:
+						base_textures = [f for f in os.listdir(textures_dir) if f.endswith('_c.dds') and "camo" not in f.lower()]
 
 					for base_f in base_textures:
 						base_dds = path.join(textures_dir, base_f)
+						
+						# Convert base DDS to PNG for Pillow manipulation
 						subprocess.run([texconv_path, "-y", "-ft", "png", "-o", textures_dir, base_dds], stdout=subprocess.DEVNULL)
 						base_png = path.splitext(base_dds)[0] + ".png"
-						
 						if not path.exists(base_png):
 							continue
 
-						base_img = Image.open(base_png).convert("RGBA")
-						r, g, b, a = base_img.split()
-						base_rgb = Image.merge("RGB", (r, g, b))
+						# Pick the matching camo texture from material mapping, by name match, or default to the first extracted camo file
+						matched_camo = None
+						if diffuse_to_camo and base_f.lower() in diffuse_to_camo:
+							target_camo = diffuse_to_camo[base_f.lower()]
+							for c_file in camo_files:
+								if c_file.lower() == target_camo:
+									matched_camo = c_file
+									break
 
-						w, h = base_img.size
-						tiled_camo = Image.new("RGB", (w, h))
-						cw, ch = camo_img.size
-						for x in range(0, w, cw):
-							for y in range(0, h, ch):
-								tiled_camo.paste(camo_img, (x, y))
+						if not matched_camo:
+							matched_camo = camo_files[0]
+							for c_file in camo_files:
+								c_stem = path.splitext(c_file)[0].lower()
+								# If a specific material camo exists for this texture, pair them
+								if c_stem in base_f.lower():
+									matched_camo = c_file
+									break
 
-						# Use the base texture's alpha channel (mask) to composite the camo 
-						# exactly where War Thunder's camouflage zones are defined, falling back to a multiply/blend if needed
-						try:
-							composite = Image.composite(tiled_camo, base_rgb, a)
-						except Exception:
-							# Fallback multiplier blend to keep dark details and weathering intact instead of washing out
-							from PIL import ImageChops
-							composite = ImageChops.multiply(base_rgb, tiled_camo)
+						camo_dds = path.join(textures_dir, matched_camo)
+						subprocess.run([texconv_path, "-y", "-ft", "png", "-o", textures_dir, camo_dds], stdout=subprocess.DEVNULL)
+						camo_png = path.splitext(camo_dds)[0] + ".png"
 
-						# Save directly onto the base png file name, then convert straight to the original base_dds path
-						composite.save(base_png)
-						subprocess.run([texconv_path, "-y", "-ft", "dds", "-o", textures_dir, base_png], stdout=subprocess.DEVNULL)
+						if path.exists(camo_png):
+							base_img = Image.open(base_png).convert("RGBA")
+							camo_img = Image.open(camo_png).convert("RGB")
 
-						base_img.close()
-						composite.close()
-						if path.exists(base_png): os.remove(base_png)
+							r, g, b, a = base_img.split()
+							base_rgb = Image.merge("RGB", (r, g, b))
 
-					if path.exists(camo_png): os.remove(camo_png)
-					print("[INFO] Texture baking and replacement completed seamlessly.")
+							w, h = base_img.size
+							cw, ch = camo_img.size
+							
+							# Tile the micro-detail camo pattern across the base texture resolution
+							tiled_camo = Image.new("RGB", (w, h))
+							for x in range(0, w, cw):
+								for y in range(0, h, ch):
+									tiled_camo.paste(camo_img, (x, y))
+
+							# Blend camo layer into the base diffuse texture
+							try:
+								composite = ImageChops.soft_light(base_rgb, tiled_camo)
+							except Exception:
+								composite = Image.composite(tiled_camo, base_rgb, a)
+
+							composite.save(base_png)
+							
+							# Re-encode composite PNG back to DDS format
+							subprocess.run([texconv_path, "-y", "-ft", "dds", "-o", textures_dir, base_png], stdout=subprocess.DEVNULL)
+
+							base_img.close()
+							camo_img.close()
+							composite.close()
+							
+							if path.exists(base_png):
+								os.remove(base_png)
+							if path.exists(camo_png):
+								os.remove(camo_png)
+
+					print("[INFO] Camouflage baking completed successfully.")
 			except Exception as e:
 				print(f"[WARNING] Automated baking routine encountered an issue: {e}")
 
