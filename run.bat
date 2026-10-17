@@ -10,6 +10,16 @@ if not exist "wt_ext_cli.exe" (
         "Invoke-WebRequest -Uri $asset.browser_download_url -OutFile 'wt_ext_cli.exe';" || goto :fail
 )
 
+if not exist "texconv.exe" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+        "$ErrorActionPreference = 'Stop';" ^
+        "$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/DirectXTex/releases/latest';" ^
+        "$asset = $release.assets | Where-Object { $_.name -like '*texconv*' -and $_.name -like '*.exe' } | Select-Object -First 1;" ^
+        "if (-not $asset) { $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Microsoft/DirectXTex/releases'; $asset = $release | ForEach-Object { $_.assets } | Where-Object { $_.name -like '*texconv*' -and $_.name -like '*.exe' } | Select-Object -First 1; }" ^
+        "if (-not $asset) { write-error 'No suitable texconv executable found.'; exit 1; }" ^
+        "Invoke-WebRequest -Uri $asset.browser_download_url -OutFile 'texconv.exe';" || goto :fail
+)
+
 if not exist ".venv\Scripts\python.exe" (
     py -3 -m venv .venv || goto :fail
     ".venv\Scripts\python.exe" -m pip install --upgrade pip

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import sys
 import traceback
+from io import BytesIO
 
 from PySide6.QtCore import (
     QObject,

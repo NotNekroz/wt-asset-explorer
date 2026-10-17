@@ -35,5 +35,6 @@ WT Exports/
 .DS_Store
 Thumbs.db
 
-# Exclude wt_ext_cli.exe
+# Exclude wt_ext_cli.exe and texconv.exe
 wt_ext_cli.exe
+texconv.exe

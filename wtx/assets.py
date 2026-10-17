@@ -418,6 +418,19 @@ class AssetLibrary:
                     cleaned = _clean_tex_name(tex)
                     if cleaned:
                         wanted.add(cleaned)
+            
+            # Also extract texture names from dynamic/camo shader parameters (t1, camo_tex, etc.)
+            try:
+                mat_params = mat.getParams() if hasattr(mat, "getParams") else {}
+                for p_key in ("camo_tex", "t1", "t0", "t2", "t3", "t4", "t5"):
+                    p_val = mat_params.get(p_key)
+                    if p_val:
+                        cleaned = _clean_tex_name(p_val)
+                        if cleaned:
+                            wanted.add(cleaned)
+            except Exception:
+                pass
+
         packs: dict[str, None] = {}
         missing = 0
         for t in wanted:

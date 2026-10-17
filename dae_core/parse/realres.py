@@ -1143,11 +1143,13 @@ class Model(Terminable):
 
 		log.log(f"Wrote {len(dat)} bytes to {fileName}")
 
-	def exportTextures(self, 
-		    output:str = getcwd(), 
-		    exportTexture:bool = True,
-		    texturePaths:TexturePathDict = None, 
-			forceConvert:bool = False):
+	def exportTextures(
+		self,
+		output: str = getcwd(),
+		exportTexture: bool = True,
+		texturePaths: TexturePathDict = None,
+		forceConvert: bool = False,
+	):
 		if self.materials is not None and exportTexture:
 			log.log("Exporting textures")
 			log.addLevel()
@@ -1155,27 +1157,36 @@ class Model(Terminable):
 			exported = set()
 
 			for mat in SafeIter(self, self.materials):
-				mat:MaterialData
-				
-				for tex in SafeIter(self, mat.textures):
-					for i in SafeRange(self, 2): # im lazy
-						if i == 0:
-							texN = mat.checkModifiedName(MaterialData.getTexFileName(tex), texturePaths)
+				mat: MaterialData
 
+				# Combine textures array with any t0, t1, t2 parameters
+				all_texs = list(mat.textures)
+				params = mat.getParams()
+				for key in ("t0", "t1", "t2", "camo_tex"):
+					val = params.get(key)
+					if isinstance(val, str) and val and val not in all_texs:
+						all_texs.append(val)
+
+				for tex in SafeIter(self, all_texs):
+					for i in SafeRange(self, 2):
+						if i == 0:
+							texN = mat.checkModifiedName(
+								MaterialData.getTexFileName(tex), texturePaths
+							)
 							if texN == tex:
 								continue
 						else:
-							tex = tex
-
 							texN = None
-						
-						if texN in exported:
+
+						if (texN or tex) in exported:
 							continue
 
-						exported.add(texN)
+						exported.add(texN or tex)
 
 						self.setSubTask(mat)
-						mat.exportTexture(tex, output, forceConvert, texturePaths, texN)
+						mat.exportTexture(
+							tex, output, forceConvert, texturePaths, texN
+						)
 						self.clearSubTask()
 
 			log.subLevel()

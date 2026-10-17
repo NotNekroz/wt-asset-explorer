@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import pickle
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -213,9 +214,27 @@ class VehicleCatalog:
 
     # ------------------------------------------------------------------ scanning
     def scan(self, status: Status) -> list[Vehicle]:
-        """Build the vehicle list from the unpacked data."""
+        """Build the vehicle list from the unpacked data (with caching)."""
         assert self.work_dir is not None, "extract() first"
 
+        cache_file = self.work_dir / "catalog_cache.pkl"
+
+        # Try loading from cache if it exists
+        if cache_file.exists():
+            status("Loading cached localizations, nations, and vehicle indices...")
+            try:
+                with open(cache_file, "rb") as f:
+                    cached_data = pickle.load(f)
+                    self.names_map = cached_data["names_map"]
+                    self.nations_map = cached_data["nations_map"]
+                    self.file_index = cached_data["file_index"]
+                    self.vehicles = cached_data["vehicles"]
+                status(f"{len(self.vehicles)} vehicles found (loaded from cache)")
+                return self.vehicles
+            except Exception as e:
+                status(f"[warning] Failed to load cache, re-scanning: {e}")
+
+        # Otherwise, perform the full scan
         status("Reading localization...")
         self.names_map = load_all_localizations(self.work_dir / "lang")
         status("Reading nations...")
@@ -259,6 +278,19 @@ class VehicleCatalog:
 
         vehicles.sort(key=lambda v: v.name)
         self.vehicles = vehicles
+
+        # Save everything to cache for future launches
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump({
+                    "names_map": self.names_map,
+                    "nations_map": self.nations_map,
+                    "file_index": self.file_index,
+                    "vehicles": self.vehicles
+                }, f)
+        except Exception as e:
+            status(f"[warning] Failed to save cache: {e}")
+
         status(f"{len(vehicles)} vehicles found")
         return vehicles
 

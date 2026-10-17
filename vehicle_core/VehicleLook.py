@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+
 NATION_NAMES = {
     "country_usa": "USA",
     "country_germany": "Germany",
@@ -99,39 +100,62 @@ def auto_find_wt_ext() -> Path | None:
     return None
 
 
+# In vehicle_core/VehicleLook.py
+
+import os
+import subprocess
+from pathlib import Path
+
+
 def run_wt_ext(
-    wt_ext_path: Path,
-    vromf_file: Path,
-    output_dir: Path,
-    folder_subpath: str = None,
+    wt_ext_bin: Path,
+    vromfs_path: Path,
+    out_dir: Path,
+    folder_subpath: str = "",
     fmt: str = "BlkText",
-):
-    if not vromf_file.exists():
-        return False
+) -> bool:
+  if not vromfs_path.exists():
+    print(f"[ERROR] Target vromfs file does not exist: {vromfs_path}")
+    return False
 
-    cmd = [
-        str(wt_ext_path),
-        "unpack_vromf",
-        "-i",
-        str(vromf_file),
-        "-o",
-        str(output_dir),
-        "--format",
-        fmt,
-        "--continue",
-        "Quiet",
-    ]
+  out_path = out_dir.resolve()
+  out_path.mkdir(parents=True, exist_ok=True)
 
-    if folder_subpath:
-        cmd.extend(["--folder", folder_subpath])
+  # Construct exact CLI arguments based on MANUAL.md specifications
+  cmd = [
+      str(wt_ext_bin.resolve()),
+      "unpack_vromf",
+      "-i",
+      str(vromfs_path.resolve()),
+      "-o",
+      str(out_path),
+      "--format",
+      fmt,
+  ]
 
-    try:
-        subprocess.run(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-        )
-        return True
-    except Exception:
-        return False
+  # If a specific subfolder inside the vromf archive was requested
+  if folder_subpath:
+    cmd.extend(["--folder", folder_subpath])
+
+  # Include War Thunder directory in PATH for native DLL access
+  env = os.environ.copy()
+  env["PATH"] = str(vromfs_path.parent) + os.pathsep + env.get("PATH", "")
+
+  try:
+    res = subprocess.run(
+        cmd, capture_output=True, text=True, env=env, timeout=180
+    )
+    if res.returncode != 0:
+      print(f"[ERROR] wt_ext_cli returned code {res.returncode}")
+      if res.stdout.strip():
+        print(f"[ERROR] stdout: {res.stdout.strip()}")
+      if res.stderr.strip():
+        print(f"[ERROR] stderr: {res.stderr.strip()}")
+      return False
+    return True
+  except Exception as e:
+    print(f"[ERROR] Subprocess execution error: {e}")
+    return False
 
 
 def register_nation(nations_map: dict, vid: str, nation: str):

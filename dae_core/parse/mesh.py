@@ -520,6 +520,12 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 
 				return (uv[0], -uv[1])
 		
+		class DUAL_SHORT_UV(UV):
+			def read(self, file:BinFile):
+				uv0 = (readSignedShort(file) / 4096, 1 + (-readSignedShort(file) / 4096))
+				uv1 = (readSignedShort(file) / 4096, 1 + (-readSignedShort(file) / 4096))
+				return (uv0, uv1)
+						
 		class HALFFLOAT_UV(UV):
 			def read(self, file:BinFile):
 				uv = unpack("ee", file.read(4))
@@ -603,7 +609,8 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			vCnt = self.__gvData.getVertexCnt()
 
 			verts:list[list[float, float, float]] = [None] * vCnt
-			UVs:list[list[float, float]] = [None] * vCnt
+			UVs0:list[list[float, float]] = [None] * vCnt
+			UVs1:list[list[float, float]] = [None] * vCnt
 
 			parser = self.getParser(format, vStride)
 
@@ -621,10 +628,17 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 						elif isinstance(parseClass, MatVData.VertexData.VERTEX):
 							verts[i] = parseClass.read(file)
 						elif isinstance(parseClass, MatVData.VertexData.UV):
-							UVs[i] = parseClass.read(file)
+							res = parseClass.read(file)
+							if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], tuple):
+								UVs0[i] = res[0]
+								UVs1[i] = res[1]
+							else:
+								UVs0[i] = res
+								UVs1[i] = res
 
 			self.__verts = verts
-			self.__UVs = UVs
+			self.__UVs = UVs0
+			self.__UVs1 = UVs1
 			
 		def __processFaces__(self, file:BinBlock):
 			if self.__unimplemented:
@@ -670,7 +684,7 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			return self.__faces
 
 		def getObj(self):
-			verts, UVs, faces = self.__verts, self.__UVs, self.__faces
+			verts, UVs0, UVs1, faces = self.__verts, self.__UVs, getattr(self, '_VertexData__UVs1', None), self.__faces
 
 			if not verts:
 				raise NotImplementedError("Can't get an obj out of an unimplemented model format")
@@ -682,25 +696,27 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			for v in SafeIter(self, verts):
 				obj += f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n"
 			
-			log.log(f"Exporting {len(UVs)} UVs")
+			log.log(f"Exporting {len(UVs0)} UVs (Channel 0)")
 
-			for v in SafeIter(self, UVs):
+			for v in SafeIter(self, UVs0):
 				obj += f"vt {v[0]:.4f} {v[1]:.4f}\n"
+
+			if UVs1 and any(UVs1):
+				log.log(f"Exporting {len(UVs1)} UVs (Channel 1)")
+				for v in SafeIter(self, UVs1):
+					obj += f"vt {v[0]:.4f} {v[1]:.4f}\n"
 
 			log.log(f"Exporting {len(faces)} faces")
 			
 			for face in SafeIter(self, faces):
 				f = ""
-
 				for idx in SafeIter(self, face):
 					idx += 1
-
 					f += f" {idx}/{idx}"
 				
 				if f == "":
 					continue
 
-				
 				obj += f"f{f}\n"
 			
 			return obj

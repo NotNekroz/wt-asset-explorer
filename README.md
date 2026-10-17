@@ -55,9 +55,10 @@ A standalone desktop tool built with **PySide6** and **Dagor Asset Explorer** lo
    git clone https://github.com/NotNekroz/wt-asset-explorer.git
    cd wt-asset-explorer
    ```
-2. **Download latest binary of wt_ext_cli:**
+2. **Download latest binary of wt_ext_cli and texconv.exe:**
    ```bash
-   https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/latest
+   wt_ext_cli: https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/latest
+   texconv.exe: https://github.com/microsoft/DirectXTex/releases/latest
    ```
 3. **Create and activate a virtual environment:**
    ```bash
