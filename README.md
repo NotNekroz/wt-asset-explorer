@@ -165,7 +165,7 @@ On Windows, run **`build_exe.bat`** from the project folder. It creates a `.venv
 
 ## Acknowledgments
 
-* Game archive unpacking and VROMF extraction powered by `wt_ext_cli.exe` - Warthunder-Open-Source-Foundation.
-* 3D model parsing and texture extraction routines built on **Dagor Asset Explorer** backend logic - quentin-dh.
+* Game archive unpacking and VROMF extraction powered by `wt_ext_cli.exe` - [Warthunder-Open-Source-Foundation](https://github.com/Warthunder-Open-Source-Foundation).
+* 3D model parsing and texture extraction routines built on **Dagor Asset Explorer** backend logic - [quentin-dh](https://github.com/quentin-dh).
 * ACL animation decoding ported from [Animation Compression Library](https://github.com/nfrechette/acl) (MIT) - Nicholas Frechette.
 * Texture conversion with `texconv` from [DirectXTex](https://github.com/microsoft/DirectXTex) - Microsoft.

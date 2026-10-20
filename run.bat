@@ -21,7 +21,8 @@ if not exist "texconv.exe" (
 )
 
 if not exist ".venv\Scripts\python.exe" (
-    py -3 -m venv .venv || goto :fail
+    rem Python 3.13 / 3.12 first: every dependency has a ready-made Windows wheel there (zstandard would need a C++ compiler on newer versions)
+    py -3.13 -m venv .venv 2>nul || py -3.12 -m venv .venv 2>nul || py -3 -m venv .venv || goto :fail
     ".venv\Scripts\python.exe" -m pip install --upgrade pip
     del ".venv\requirements.installed" 2>nul
 )
