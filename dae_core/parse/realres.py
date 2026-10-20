@@ -632,6 +632,9 @@ class Model(Terminable):
 
 			self.faces:list[tuple[int, int, int]] = []
 			self.materials:dict[int, str] = {0:f"none_{name}"}
+			# start face -> index into the model's material list (names are NOT unique: six glass materials are all
+			# called 'dynamic_glass_chrome' and one has an empty name, so the glTF exporter needs the index)
+			self.material_ids:dict[int, int] = {}
 		
 		@property
 		def name(self):
@@ -651,11 +654,13 @@ class Model(Terminable):
 		def setFaces(self, faces:tuple[tuple[int, int, int]]):
 			self.faces = faces
 		
-		def appendMaterial(self, materialName:str, startFaceIdx:int = None):
+		def appendMaterial(self, materialName:str, startFaceIdx:int = None, materialId:int = None):
 			if startFaceIdx == None:
 				startFaceIdx = self.faceCount
 			
 			self.materials[startFaceIdx] = materialName
+			if materialId is not None:
+				self.material_ids[startFaceIdx] = materialId
 	
 	DEFAULT_SCALE = (1, 1, 1)
 	DEFAULT_OFFSET = (0, 0, 0, 0)
@@ -731,6 +736,11 @@ class Model(Terminable):
 		
 		log.log(f"Appended {len(mdl.__vertices)} vertices and UVs (offset = {vOfs})")
 
+		# The merged model's material list goes AFTER ours, so the indices its objects carry (material_ids) must move by
+		# the size of the list they were appended to; otherwise they point at our first materials (the skinned tracks of
+		# the Leclerc got the machine gun's and the gun's material in the GLB).
+		matOfs = len(self.materials) if self.materials is not None else 0
+
 		if mdl.materials is not None:
 			if self.materials is None:
 				self.__materials = mdl.materials
@@ -746,7 +756,8 @@ class Model(Terminable):
 			log.log(f"Merging {obj.name}'s {len(obj.faces)} faces")
 
 			for startIdx in obj.materials:
-				newObj.appendMaterial(obj.materials[startIdx], startIdx)
+				matId = getattr(obj, "material_ids", {}).get(startIdx)
+				newObj.appendMaterial(obj.materials[startIdx], startIdx, None if matId is None else matId + matOfs)
 			
 			for face in SafeIter(self, obj.faces):
 				newObj.appendFace(tuple(idx + vOfs for idx in face))
@@ -1171,6 +1182,9 @@ class Model(Terminable):
 						all_texs.append(val)
 
 				for tex in SafeIter(self, all_texs):
+					if mat.skipsCamoTexture(tex):       # skin preview: the skin replaces this diffuse, its camo is not needed
+						continue
+
 					for i in SafeRange(self, 2):
 						if i == 0:
 							texN = mat.checkModifiedName(
@@ -1824,7 +1838,7 @@ class RendInst(RealResData, ModelContainer):
 
 				curFace = elem.startI // 3
 
-				obj.appendMaterial(mdl.getMaterialName(elem.mat))
+				obj.appendMaterial(mdl.getMaterialName(elem.mat), None, elem.mat)
 				
 				for i in SafeRange(self, curFace, curFace + elem.numFace):
 					obj.appendFace(tuple(f + indiceOffset for f in faces[i]))
@@ -2435,6 +2449,7 @@ class CollisionGeom(RealResData, ModelContainer):
 			return None
 		else:
 			return assets[0]
+		
 		
 	
 	def getModel(self, lodId:int = 0, singleMesh:bool = False):

@@ -1,4 +1,6 @@
 PySide6>=6.8
-Pillow>=10.0
+numpy>=1.26
+Pillow>=11.3          # 11.3+ decodes AVIF (weapon icons); older versions need pillow-avif-plugin
+pygltflib>=1.16
 zstandard>=0.22
-# pylzma>=0.5   (optional - the standard library lzma is used if it's missing)
+# pylzma>=0.5         # optional - the standard library lzma is used if it's missing

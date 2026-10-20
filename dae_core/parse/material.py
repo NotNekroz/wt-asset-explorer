@@ -18,61 +18,62 @@ from PIL.ImageChops import invert
 
 DDSX_HEADER_SIZE = 0x20
 
-DYNAMIC_CLASSES = (
-    "dynamic_masked_ship",
-    "dynamic_painted_by_mask",
-    "dynamic_masked",
-    "dynamic_alpha_blend",
-    "dynamic_camo",
-)
+# [REMOVED in cleanup] DYNAMIC_CLASSES  (material.py lines 21-27 of the pre-cleanup file, module level, just after DDSX_HEADER_SIZE).
+#   What it was: tuple of War Thunder shader class names that use dynamic camo painting:
+#   "dynamic_masked_ship", "dynamic_painted_by_mask", "dynamic_masked", "dynamic_alpha_blend", "dynamic_camo".
+#   Worked with: nothing any more. It was the class whitelist of the first camo-bake version (only these shader classes
+#   were baked), later replaced by the substring test in CAMO_CLASS_KEYS / CAMO_CLASS_EXCLUDED / isCamoClass(), which
+#   also covers tanks, ground vehicles and boats. No other file referenced it.
 
 import subprocess
 import tempfile
+import shutil
+from pathlib import Path
 
 def _texconv_convert_dds_bytes(dds_bytes: bytes, output_format: str = "DDS"):
-    try:
-        from util.misc import ROOT_FOLDER as _WTX_ROOT # [WTX patch] do not depend on the CWD
-        texconv_path = path.join(_WTX_ROOT, "texconv.exe")
+	try:
+		from util.misc import ROOT_FOLDER as _WTX_ROOT # [WTX patch] do not depend on the CWD
+		texconv_path = path.join(_WTX_ROOT, "texconv.exe")
 
-        if not path.exists(texconv_path):
-            print("[ERROR] texconv.exe not found!")
-            return None
+		if not path.exists(texconv_path):
+			print("[ERROR] texconv.exe not found!")
+			return None
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            in_file = path.join(tmpdir, "input.dds")
+		with tempfile.TemporaryDirectory() as tmpdir:
+			in_file = path.join(tmpdir, "input.dds")
 
-            with open(in_file, "wb") as f:
-                f.write(dds_bytes)
+			with open(in_file, "wb") as f:
+				f.write(dds_bytes)
 
-            result = subprocess.run(
-                [
-                    texconv_path,
-                    "-y",
-                    "-ft", output_format.lower(),
-                    "-o", tmpdir,
-                    in_file
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
+			result = subprocess.run(
+				[
+					texconv_path,
+					"-y",
+					"-ft", output_format.lower(),
+					"-o", tmpdir,
+					in_file
+				],
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE
+			)
 
-            if result.returncode != 0:
-                print("[texconv FAIL]")
-                print(result.stderr.decode(errors="ignore"))
-                return None
+			if result.returncode != 0:
+				print("[texconv FAIL]")
+				print(result.stderr.decode(errors="ignore"))
+				return None
 
-            out_file = path.join(tmpdir, f"input.{output_format.lower()}")
+			out_file = path.join(tmpdir, f"input.{output_format.lower()}")
 
-            if not path.exists(out_file):
-                print("[texconv ERROR] Output file missing")
-                return None
+			if not path.exists(out_file):
+				print("[texconv ERROR] Output file missing")
+				return None
 
-            with open(out_file, "rb") as f:
-                return f.read()
+			with open(out_file, "rb") as f:
+				return f.read()
 
-    except Exception as e:
-        print(f"[texconv EXCEPTION] {e}")
-        return None
+	except Exception as e:
+		print(f"[texconv EXCEPTION] {e}")
+		return None
 
 class DDSx(Packed):
 	class Header:
@@ -238,7 +239,7 @@ class DDSx(Packed):
 		return f"<DDsX {self.name}: {self.__header.getFormattedData()}>"
 
 	def __init__(self, 
-	      filePath:str, 
+		  filePath:str, 
 		  name:str = None, 
 		  size:int = 0, 
 		  dataOffset:int = DDSX_HEADER_SIZE, 
@@ -696,7 +697,9 @@ class MaterialData(Terminable):
 			if detail is None and i + 1 < len(self.__textureSlots):
 				addComp(components, self.__textureSlots[i + 1])
 
-		return "_".join(components)
+		# A material whose slots give no name part (the F-16 canopy) used to get "" here: an empty "newmtl" / "usemtl" that
+		# Blender cannot resolve (it falls back to a plain white opaque default) and that the texture prune dropped.
+		return "_".join(components) or self.cls or "material"
 
 	def checkModifiedName(self, tex:str, texturePaths:TexturePathDict):
 		if texturePaths is None or texturePaths.get(tex + "m") is None:
@@ -798,8 +801,94 @@ class MaterialData(Terminable):
 		print(f"[SKIP] Failed to convert texture: {texture}")
 		return data, newName
 	
+	_exportedTextures = set()  # (output file, forceConvert, texN) already written by this process
+
+	def skipsCamoTexture(self, tex) -> bool:
+		"""True for the camo texture of a material whose diffuse the skin replaces: it would only be extracted for a bake that no longer happens."""
+		if not SKIN_OVERRIDES or not self.diffuse or skinOverride(self.diffuse) is None:
+			return False
+
+		base = str(tex).split("*")[0].lower()
+		return "camo" in base and base != str(self.diffuse).split("*")[0].lower() and isCamoClass(self.cls)
+
+	def _exportSkinTexture(self, name: str, src: str, outpath: str) -> bool:
+		"""Write the skin's picture for texture `name` into <outpath>/<name>.dds. Colour: opaque (on camo materials the alpha is the
+		paint mask, not transparency). Normal map (*_n): kept in the game's channel layout, the derived <n>_obj.dds / <n>_gltf.png of an
+		earlier export are removed so the exporters rebuild them from this one."""
+		key = name.lower()
+
+		if key in _skinWritten:
+			return True
+
+		import numpy as np
+
+		arr = _loadSkinRgba(src)
+		makedirs(outpath, exist_ok=True)
+
+		if key.endswith("_n"):
+			for stale in (f"{name}_obj.dds", f"{name}_gltf.png", f"{name}_mr.png", f"{name}_rough.png", f"{name}_metal.png"):
+				try:
+					os.remove(path.join(outpath, stale))
+				except OSError:
+					pass
+
+			# The exporters read a normal map in the layout of the game's own ones: X in alpha, Y in green. Say what the skin's file holds, so a
+			# normal map saved in another layout (plain RGB, alpha all 255) is visible in the log instead of just "not working".
+			rng = lambda c: f"{int(arr[..., c].min())}-{int(arr[..., c].max())}"
+			print(f"[skin] normal map {path.basename(src)} ({arr.shape[1]}x{arr.shape[0]}): red {rng(0)}, green {rng(1)}, alpha {rng(3)}")
+
+			if arr[..., 3].min() == arr[..., 3].max():
+				print(f"[skin] WARNING {path.basename(src)}: the alpha channel is one flat value. The preview reads the normal's X from alpha (the layout "
+				      "of the game's own normal maps), so this file will show flat / wrong in the preview.")
+		elif isCamoClass(self.cls) or arr[..., 3].max() == 0:
+			arr[..., 3] = 255
+
+		Image.fromarray(np.ascontiguousarray(arr), "RGBA").save(path.join(outpath, f"{name}.dds"), format="DDS")
+
+		if key.endswith("_n") and SKIN_GLTF[0]:
+			# gltf_conv builds this PNG itself later but swallows every error; doing it here says why it failed.
+			raw = path.join(outpath, f"{name}.dds")
+			png = path.join(outpath, f"{name}_gltf.png")
+
+			try:
+				from parse.gltf_conv import make_gltf_normal
+				make_gltf_normal(Path(raw))
+			except Exception as e:
+				print(f"[skin] WARNING {name}: GLB normal map failed: {type(e).__name__}: {e}")
+
+			if path.exists(png):
+				print(f"[skin] {name}_gltf.png built from the skin's normal map")
+			else:
+				print(f"[skin] WARNING {name}: no {name}_gltf.png was produced from {path.basename(src)}; the GLB will point at the raw .dds instead")
+				try:
+					Image.open(raw).load()
+				except Exception as e:
+					print(f"[skin]   the written {name}.dds cannot be read back: {type(e).__name__}: {e}")
+
+		_skinWritten.add(key)
+		SKIN_USED.add(key)
+		log.log(f"Skin texture {path.basename(src)} -> {name}.dds")
+		return True
+
 	def exportTexture(self, texture:str, output:str = getcwd(), forceConvert:bool = False, texturePaths:TexturePathDict = None, texN:str = None):
 		outpath = path.join(output, "textures")
+
+		skinSrc = skinOverride(texture)
+
+		if skinSrc is not None and texN in (None, str(texture).split("*")[0]):
+			try:
+				self._exportSkinTexture(str(texture).split("*")[0], skinSrc, outpath)
+				return
+			except Exception as e:
+				print(f"[WARNING] Skin texture {path.basename(skinSrc)} not used ({type(e).__name__}: {e}); extracting the game's {texture} instead")
+
+		# The same texture is requested by several materials / slots; converting + writing it again is pure waste.
+		doneKey = (path.abspath(path.join(outpath, str(texture).split("*")[0] + ".dds")), forceConvert, texN)
+
+		if doneKey in MaterialData._exportedTextures and path.exists(doneKey[0]):
+			return
+
+		MaterialData._exportedTextures.add(doneKey)
 
 		if not path.exists(outpath):
 			mkdir(outpath)
@@ -1015,6 +1104,416 @@ class MaterialData(Terminable):
 
 		return fullVMT
 
+# [gltf] Decode War Thunder's packed normal map (X in alpha, Y in green) into a standard RGB tangent-space
+# normal map. Written next to the original as <name>_gltf.png; the original .dds is NOT touched.
+NORMAL_FLIP_G = False  # True if bumps look inverted in your viewer (DirectX vs OpenGL green channel)
+
+def decodeNormalForGltf(ddsPath: str):
+	try:
+		import numpy as np
+		dst = path.splitext(ddsPath)[0] + "_gltf.png"
+
+		if not path.exists(ddsPath) or path.exists(dst):
+			return dst if path.exists(dst) else None
+
+		arr = readDdsRgba(ddsPath)
+
+		if arr is None:
+			img = Image.open(ddsPath).convert("RGBA")
+			arr = np.asarray(img)
+			img.close()
+
+		# X is stored in alpha, Y in green; Z is rebuilt. float32 in-place maths keeps this fast on 4096x4096.
+		nx = arr[..., 3].astype(np.float32)
+		ny = arr[..., 1].astype(np.float32)
+		nx *= 2.0 / 255.0
+		nx -= 1.0
+		ny *= 2.0 / 255.0
+		ny -= 1.0
+
+		if NORMAL_FLIP_G:
+			np.negative(ny, out=ny)
+
+		nz = 1.0 - nx * nx - ny * ny
+		np.clip(nz, 0.0, 1.0, out=nz)
+		np.sqrt(nz, out=nz)
+
+		out = np.empty(arr.shape[:2] + (3,), dtype=np.uint8)
+		out[..., 0] = (nx * 127.5 + 127.5 + 0.5).astype(np.uint8)
+		out[..., 1] = (ny * 127.5 + 127.5 + 0.5).astype(np.uint8)
+		out[..., 2] = (nz * 127.5 + 127.5 + 0.5).astype(np.uint8)
+
+		Image.fromarray(out, "RGB").save(dst, compress_level=1)
+
+		return dst
+	except Exception as e:
+		print(f"[WARNING] Could not decode normal map {ddsPath}: {e}")
+		return None
+
+# [obj] Same decode as decodeNormalForGltf, but written as an UNCOMPRESSED .dds (<n>_obj.dds) for the OBJ/MTL path.
+# Blender's OBJ importer feeds map_Bump into a Normal Map node, which expects plain RGB tangent-space normals; the game's
+# packed original (X in alpha, Y in green, red = other data) therefore shades wrongly. The original <n>.dds is NOT touched.
+def decodeNormalForObj(ddsPath: str):
+	try:
+		import numpy as np
+		dst = path.splitext(ddsPath)[0] + "_obj.dds"
+
+		if not path.exists(ddsPath) or path.exists(dst):
+			return dst if path.exists(dst) else None
+
+		arr = readDdsRgba(ddsPath)
+
+		if arr is None:
+			img = Image.open(ddsPath).convert("RGBA")
+			arr = np.asarray(img)
+			img.close()
+
+		nx = arr[..., 3].astype(np.float32)
+		ny = arr[..., 1].astype(np.float32)
+		nx *= 2.0 / 255.0
+		nx -= 1.0
+		ny *= 2.0 / 255.0
+		ny -= 1.0
+
+		if NORMAL_FLIP_G:
+			np.negative(ny, out=ny)
+
+		nz = 1.0 - nx * nx - ny * ny
+		np.clip(nz, 0.0, 1.0, out=nz)
+		np.sqrt(nz, out=nz)
+
+		out = np.empty(arr.shape[:2] + (4,), dtype=np.uint8)
+		out[..., 0] = (nx * 127.5 + 127.5 + 0.5).astype(np.uint8)
+		out[..., 1] = (ny * 127.5 + 127.5 + 0.5).astype(np.uint8)
+		out[..., 2] = (nz * 127.5 + 127.5 + 0.5).astype(np.uint8)
+		out[..., 3] = 255
+
+		tmp = dst + ".part"   # a half-written file must never be mistaken for a finished one
+		Image.fromarray(out, "RGBA").save(tmp, format="DDS")
+		os.replace(tmp, dst)
+
+		return dst
+	except Exception as e:
+		print(f"[WARNING] Could not decode normal map for OBJ {ddsPath}: {e}")
+		return None
+
+# [obj] Gloss and metal of a War Thunder _n texture for the OBJ/MTL path. The _n carries them next to the normal: red = smoothness
+# (bright = glossy), blue = metalness (War Thunder wiki: PBR texture compliance). Blender's OBJ importer reads map_Pr (roughness)
+# and map_Pm (metallic) as greyscale pictures, so write <n>_rough.png (255 - red) and <n>_metal.png (blue). The original <n>.dds
+# is NOT touched. Used for the game's own normal maps and for a custom skin's alike (the GLB does the same, gltf_conv.make_gltf_mr).
+GLOSS_SMOOTH_SCALE = 0.78  # red (smoothness) is multiplied by this before it becomes roughness; lower = rougher / less shiny (1.0 = the raw value)
+GLOSS_METAL_SCALE = 1.0    # blue (metalness) is multiplied by this; lower = less metal. 0 = no metal at all
+
+def glossMetalMaps(arr, label: str = ""):
+	"""The _n texture's RGBA array -> (roughness, metalness) as uint8 pictures, the one place both exporters take them from.
+	Also logs the range of the two channels, so a too shiny / too dull result can be traced to the data."""
+	import numpy as np
+	red, blue = arr[..., 0], arr[..., 2]
+	print(f"[gloss] {label}: smoothness (red) {int(red.min())}-{int(red.max())} mean {float(red.mean()):.0f}, "
+	      f"metal (blue) {int(blue.min())}-{int(blue.max())} mean {float(blue.mean()):.0f}")
+	smooth = np.clip(red.astype(np.float32) * GLOSS_SMOOTH_SCALE, 0, 255)
+	metal = np.clip(blue.astype(np.float32) * GLOSS_METAL_SCALE, 0, 255)
+	return (255.0 - smooth + 0.5).astype(np.uint8), (metal + 0.5).astype(np.uint8)
+
+def decodeGlossMetalForObj(ddsPath: str):
+	try:
+		import numpy as np
+		base = path.splitext(ddsPath)[0]
+		rough, metal = base + "_rough.png", base + "_metal.png"
+
+		if not path.exists(ddsPath):
+			return None
+
+		# Already built from this very file (or a newer one): keep it. A custom skin's stale pair is deleted when the skin is written.
+		srcTime = path.getmtime(ddsPath)
+		if all(path.exists(p) and path.getmtime(p) >= srcTime for p in (rough, metal)):
+			return rough, metal
+
+		arr = readDdsRgba(ddsPath)
+
+		if arr is None:
+			img = Image.open(ddsPath).convert("RGBA")
+			arr = np.asarray(img)
+			img.close()
+
+		roughArr, metalArr = glossMetalMaps(arr, path.basename(base))
+		Image.fromarray(np.ascontiguousarray(roughArr), "L").save(rough, compress_level=1)
+		Image.fromarray(np.ascontiguousarray(metalArr), "L").save(metal, compress_level=1)
+
+		return rough, metal
+	except Exception as e:
+		print(f"[WARNING] Could not build the gloss / metal maps of {ddsPath} for the OBJ: {e}")
+		return None
+
+def hasGlossMetal(normalName, cls) -> bool:
+	"""Does a material get gloss / metal pictures from its normal map? Only a game-layout *_n texture holds them, and glass keeps its own look."""
+	if not normalName or "glass" in str(cls or "").lower():
+		return False
+
+	name = str(normalName).split("*")[0].lower()
+	if name.endswith(".dds"):
+		name = name[:-4]
+
+	return name.endswith("_n")
+
+# [obj-glass] Look of the canopy / glass materials in the OBJ (the GLB has its own, see gltf_conv.glass_look).
+OBJ_GLASS_TINT = (0.93, 0.96, 1.0)   # Kd when the material sets no colour of its own: almost clear, a hint of blue
+OBJ_GLASS_ALPHA_SCALE = 0.6          # game opacity * this = d (lower = more see-through)
+OBJ_GLASS_ALPHA_MIN = 0.04           # never fully invisible (coloured glass)
+OBJ_GLASS_CLEAR_ALPHA = 0.025        # d of "clear" glass (canopy, light colour): the value that looks right in Blender
+OBJ_GLASS_CLEAR_MIN = 0.55           # clear = darkest colour channel at least this; coloured lenses keep the scaled game opacity
+OBJ_GLASS_NS = 900.0                 # shininess (Blender roughness ~ 1 - sqrt(Ns/1000))
+
+# [multi-camo] ------------------------------------------------------------------------------------------------
+# One diffuse (t0) can be painted with several different camos (e.g. the Verdun hull uses
+# camo_flatgullgrey / camo_honedgrey / camo_red / camo_black_a26f over the SAME destroyer_..._c texture).
+# So the baked result is stored once per (diffuse, camo) pair as "<diffuse>__<camo>.dds" and every
+# material's map_Kd points at its own pair. The original <diffuse>.dds is never overwritten.
+CAMO_CLASS_KEYS = ("tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted", "dynamic_camo")
+CAMO_CLASS_EXCLUDED = ("aircraft", "cockpit", "building")
+
+# [skin preview] ------------------------------------------------------------------------------------------------
+# While a custom-skin preview is exported, SKIN_OVERRIDES maps a game texture name (lower case) to the picture the skin
+# supplies for it. exportTexture() then writes that picture instead of extracting the game's texture, and getCamoPair()
+# reports no camo for an overridden diffuse (the skin already is the finished picture), so neither the OBJ nor the GLB
+# bakes it and both point at the plain <texture>.dds. Textures the skin does not supply go the normal way.
+SKIN_OVERRIDES = {}
+SKIN_USED = set()          # overridden names actually written during this export
+SKIN_GLTF = [False]        # GLB export: build each skin normal's <n>_gltf.png right away, so a failure is reported
+_skinWritten = set()
+
+def setSkinOverrides(mapping: dict, gltf: bool = False):
+	SKIN_GLTF[0] = bool(gltf)
+	SKIN_OVERRIDES.clear()
+	SKIN_USED.clear()
+	_skinWritten.clear()
+	SKIN_OVERRIDES.update({str(k).lower(): str(v) for k, v in (mapping or {}).items()})
+
+def clearSkinOverrides():
+	SKIN_OVERRIDES.clear()
+	_skinWritten.clear()
+
+def skinOverride(name):
+	if not SKIN_OVERRIDES or not name:
+		return None
+	return SKIN_OVERRIDES.get(str(name).split("*")[0].lower())
+
+def _loadSkinRgba(src: str):
+	"""A skin picture (.tga/.png/.dds/...) as an (h, w, 4) uint8 RGBA ndarray."""
+	import numpy as np
+
+	if str(src).lower().endswith(".dds"):
+		tmp = tempfile.mkdtemp(prefix="wtskin_")
+
+		try:
+			arr = _loadDdsArray(str(src), tmp)
+		finally:
+			shutil.rmtree(tmp, ignore_errors=True)
+
+		if arr is None:
+			raise RuntimeError(f"could not decode {path.basename(src)}")
+
+		return np.array(arr, dtype=np.uint8)
+
+	with Image.open(src) as im:
+		return np.array(im.convert("RGBA"), dtype=np.uint8)
+
+def isCamoClass(cls) -> bool:
+	cls = str(cls).lower()
+	return any(k in cls for k in CAMO_CLASS_KEYS) and not any(x in cls for x in CAMO_CLASS_EXCLUDED)
+
+def getCamoPair(material):
+	"""(diffuse, camo) as clean texture names; camo is None when the material has no camo texture."""
+	diffuse = material.diffuse
+
+	if diffuse is None:
+		return None, None
+
+	diffuse = str(diffuse).split("*")[0]
+	camo = None
+
+	if skinOverride(diffuse) is not None:
+		return diffuse, None      # the skin supplies the finished picture: no camo is baked into it
+
+	if isCamoClass(material.cls):
+		for idx, slot in enumerate(material.getTextureSlots()):
+			if idx > 0 and slot and "camo" in str(slot).lower():
+				camo = str(slot).split("*")[0]
+				break
+
+	return diffuse, camo
+
+def bakedDiffuseName(diffuse: str, camo: str = None) -> str:
+	return f"{diffuse}__{camo}" if camo else diffuse
+
+def _findTexconv() -> str:
+	try:
+		from util.misc import ROOT_FOLDER
+		candidate = path.join(ROOT_FOLDER, "texconv.exe")
+
+		if path.exists(candidate):
+			return candidate
+	except Exception:
+		pass
+
+	return "texconv.exe"
+
+def _loadDdsImage(ddsPath: str, tmpDir: str):
+	"""Opens a DDS as RGBA, via Pillow first and texconv->PNG as fallback. Temp files stay in tmpDir."""
+	try:
+		img = Image.open(ddsPath)
+		img.load()
+		return img.convert("RGBA")
+	except Exception:
+		pass
+
+	try:
+		subprocess.run([_findTexconv(), "-y", "-ft", "png", "-o", tmpDir, ddsPath],
+					   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		png = path.join(tmpDir, path.splitext(path.basename(ddsPath))[0] + ".png")
+
+		if path.exists(png):
+			img = Image.open(png)
+			img.load()
+			return img.convert("RGBA")
+	except Exception as e:
+		print(f"[WARNING] Could not read {ddsPath}: {e}")
+
+	return None
+
+def readDdsRgba(ddsPath: str):
+	"""Fast reader for UNCOMPRESSED 24/32-bit DDS files (what this exporter writes) -> (h, w, 4) uint8 RGBA.
+	Pillow decodes these very slowly on big textures (30s+ for 4096x4096). Returns None for anything else."""
+	import numpy as np
+
+	try:
+		with open(ddsPath, "rb") as f:
+			head = f.read(128)
+
+			if len(head) < 128 or head[:4] != b"DDS ":
+				return None
+
+			h, w = unpack("<II", head[12:20])
+			pfFlags, fourcc, bits, rm, gm, bm, am = unpack("<I4sIIIII", head[80:108])
+
+			if fourcc == b"DX10" or not (pfFlags & 0x40) or bits not in (24, 32):
+				return None  # compressed / DX10 / palettised -> let Pillow handle it
+
+			bpp = bits // 8
+			raw = f.read(w * h * bpp)
+
+		if len(raw) < w * h * bpp:
+			return None
+
+		arr = np.frombuffer(raw, dtype=np.uint8).reshape(h, w, bpp)
+
+		def chan(mask):
+			if mask == 0:
+				return None
+			idx = (mask.bit_length() - 1) // 8
+			return arr[..., idx] if idx < bpp and mask in (0xFF << (8 * idx),) else False
+
+		r, g, b, a = chan(rm), chan(gm), chan(bm), chan(am)
+
+		if r is None or g is None or b is None or r is False or g is False or b is False or a is False:
+			return None
+
+		out = np.empty((h, w, 4), dtype=np.uint8)
+		out[..., 0], out[..., 1], out[..., 2] = r, g, b
+		out[..., 3] = 255 if a is None else a
+		return out
+	except Exception:
+		return None
+
+def _loadDdsArray(ddsPath: str, tmpDir: str):
+	"""DDS -> (h, w, 4) uint8 RGBA ndarray: fast reader, then Pillow/texconv through _loadDdsImage."""
+	import numpy as np
+
+	arr = readDdsRgba(ddsPath)
+
+	if arr is not None:
+		return arr
+
+	img = _loadDdsImage(ddsPath, tmpDir)
+	return np.asarray(img) if img is not None else None
+
+def bakeCamoPairs(texturesDir: str, pairs: dict):
+	"""pairs = {bakedName: (diffuse, camo)}. Writes textures/<bakedName>.dds for every pair."""
+	import numpy as np
+
+	texconv = _findTexconv()
+	hasTexconv = path.exists(texconv) or shutil.which(texconv) is not None
+
+	with tempfile.TemporaryDirectory() as tmp:  # temp PNGs live here, never in textures/
+		baseCache = {}  # diffuse -> (rgb ndarray, alpha ndarray) - the same diffuse is reused by every camo
+		camoCache = {}  # camo -> rgb ndarray
+		tileCache = {}  # (camo, w, h) -> tiled rgb ndarray
+
+		for bakedName, (diffuse, camo) in pairs.items():
+			baseDds = path.join(texturesDir, diffuse + ".dds")
+			camoDds = path.join(texturesDir, camo + ".dds")
+
+			if not path.exists(baseDds) or not path.exists(camoDds):
+				print(f"[WARNING] Camo bake skipped for {bakedName}: missing {diffuse}.dds or {camo}.dds")
+				continue
+
+			if diffuse not in baseCache:
+				arr = _loadDdsArray(baseDds, tmp)
+				baseCache[diffuse] = None if arr is None else (arr[..., :3], arr[..., 3])
+
+			if camo not in camoCache:
+				arr = _loadDdsArray(camoDds, tmp)
+				camoCache[camo] = None if arr is None else np.ascontiguousarray(arr[..., :3])
+
+			base = baseCache[diffuse]
+			camoArr = camoCache[camo]
+
+			if base is None or camoArr is None:
+				print(f"[WARNING] Camo bake skipped for {bakedName}: could not decode textures")
+				continue
+
+			baseRgb, alpha = base
+			h, w = alpha.shape
+			ch, cw = camoArr.shape[:2]
+
+			# Tile the camo pattern across the base texture resolution (one np.tile, no per-tile paste loop)
+			key = (camo, w, h)
+
+			if key not in tileCache:
+				reps = (-(-h // ch), -(-w // cw), 1)
+				tileCache[key] = np.tile(camoArr, reps)[:h, :w]
+
+			tiled = tileCache[key]
+
+			# The diffuse's ALPHA is the paint mask (white = painted hull/superstructure, black = bare metal/details).
+			# Painted areas take the camo colour, unpainted areas keep the base colour (rust, grime, waterline growth).
+			a = alpha[..., None].astype(np.uint16)
+			out = ((tiled.astype(np.uint16) * a + baseRgb.astype(np.uint16) * (255 - a) + 127) // 255).astype(np.uint8)
+			composite = Image.fromarray(out, "RGB")
+
+			outDds = path.join(texturesDir, bakedName + ".dds")
+
+			if path.exists(outDds):
+				try:
+					os.remove(outDds)  # never keep a stale bake if the re-encode below fails
+				except OSError:
+					pass
+
+			# Re-encode to DDS: texconv when it is really available, otherwise straight through Pillow
+			if hasTexconv:
+				try:
+					outPng = path.join(tmp, bakedName + ".png")
+					composite.save(outPng)
+					subprocess.run([texconv, "-y", "-ft", "dds", "-o", texturesDir, outPng],
+								   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+				except Exception:
+					pass
+
+			if not path.exists(outDds):
+				composite.save(outDds, format="DDS")
+
+			print(f"[INFO] Baked {bakedName}.dds")
+
 class MaterialTemplateLibrary(Terminable):
 	class Material(Terminable):
 		def __repr__(self):
@@ -1029,43 +1528,44 @@ class MaterialTemplateLibrary(Terminable):
 
 			matParams = material.getParams()
 
-			if "opacity" in matParams:
+			if "glass" in str(getattr(material, "cls", "") or "").lower():
+				# Canopy / glass: always write an explicit alpha (a missing "opacity" left it opaque white in Blender),
+				# a light colour, and a shiny surface.
+				try:
+					opacity = float(matParams.get("opacity", 0.5))
+				except (TypeError, ValueError):
+					opacity = 0.5
+				diff = tuple(getattr(material, "diff", None) or (0, 0, 0, 1))
+				kd = diff[:3] if sum(diff[:3]) > 1e-6 else OBJ_GLASS_TINT   # coloured lenses (nav lights) keep their colour
+				if min(kd) >= OBJ_GLASS_CLEAR_MIN:
+					alpha = OBJ_GLASS_CLEAR_ALPHA
+				else:
+					alpha = max(opacity * OBJ_GLASS_ALPHA_SCALE, OBJ_GLASS_ALPHA_MIN)
+				self.setParam("Kd", f"{kd[0]:.3f} {kd[1]:.3f} {kd[2]:.3f}")
+				self.setParam("d", f"{alpha:.3f}")
+				self.setParam("Tr", f"{1.0 - alpha:.3f}")
+				self.setParam("Ns", OBJ_GLASS_NS)
+			elif "opacity" in matParams:
 				self.setParam("d", matParams["opacity"])
 
-			# Inspect texture slots directly to find diffuse (t0) and camo (t1 / camo textures)
-			slots = material.getTextureSlots()
-			diffuse_tex = material.diffuse
-			camo_tex = None
+			# Each material points at ITS OWN baked diffuse: <diffuse>__<camo>.dds (or plain <diffuse>.dds, no camo)
+			diffuse_name, camo_name = getCamoPair(material)
 
-			for idx, slot in enumerate(slots):
-				if slot:
-					slot_str = str(slot).lower()
-					if idx > 0 and ("camo" in slot_str or idx == 1):
-						camo_tex = slot
-						break
-
-			# Fallback to matParams if needed
-			if not camo_tex:
-				for param_key in ("camo_tex", "t1", "t0", "t2"):
-					val = matParams.get(param_key)
-					if val:
-						camo_tex = val
-						break
-
-			# Point directly to the standard diffuse filename (e.g., leclerc_s2_body_c.dds), which will be overwritten by the baked version
-			final_tex_name = diffuse_tex
-
-			if final_tex_name is not None:
-				clean_tex = str(final_tex_name).split("*")[0]
-				if not clean_tex.endswith(".dds"):
-					clean_tex += ".dds"
-				self.setParam("map_Kd", "textures/" + clean_tex)
+			if diffuse_name is not None:
+				self.setParam("map_Kd", "textures/" + bakedDiffuseName(diffuse_name, camo_name) + ".dds")
 
 			if material.normal is not None:
 				norm_tex = str(material.normal).split("*")[0]
-				if not norm_tex.endswith(".dds"):
-					norm_tex += ".dds"
-				self.setParam("map_bump", "textures/" + norm_tex)
+				# OBJ: the decoded RGB normal map <n>_obj.dds written by decodeNormalForObj(). Only the GLB uses
+				# <n>_gltf.png, which gltf_conv.make_gltf_normal() builds itself.
+				if norm_tex.lower().endswith(".dds"):
+					norm_tex = norm_tex[:-4]
+				self.setParam("map_bump", "textures/" + norm_tex + "_obj.dds")
+
+				# Gloss (red) and metal (blue) of the same _n: Blender reads map_Pr / map_Pm. Written by decodeGlossMetalForObj().
+				if hasGlossMetal(norm_tex, getattr(material, "cls", None)):
+					self.setParam("map_Pr", "textures/" + norm_tex + "_rough.png")
+					self.setParam("map_Pm", "textures/" + norm_tex + "_metal.png")
 		
 		def setParam(self, name, value):
 			if value == None:
@@ -1085,7 +1585,7 @@ class MaterialTemplateLibrary(Terminable):
 			for slot in self.material.getTextureSlots():
 				if slot:
 					clean_name = str(slot).split("*")[0]
-					if clean_name:
+					if clean_name and not self.material.skipsCamoTexture(clean_name):
 						try:
 							self.material.exportTexture(
 								clean_name, outpath, forceConvert=forceConvert
@@ -1116,7 +1616,8 @@ class MaterialTemplateLibrary(Terminable):
 		log.log("Exporting MTL textures")
 		log.addLevel()
 
-		has_dynamic_camo = False
+		# [REMOVED in cleanup] `has_dynamic_camo = False`  (material.py line 1354 of the pre-cleanup file, start of
+		#   MaterialTemplateLibrary.exportTextures). Initial value of the per-model camo flag described in the note inside the loop below.
 
 		for mat in SafeIter(self, self.__mats):
 			mat: MaterialTemplateLibrary.Material
@@ -1126,130 +1627,48 @@ class MaterialTemplateLibrary(Terminable):
 
 			mat.exportTextures(outpath, forceConvert)
 
-			# Gate execution: Enable dynamic camo baking for ground vehicles, tanks, and ships
-			cls_name = str(mat.material.cls).lower()
-			if any(k in cls_name for k in ("tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted")):
-				if not any(excluded in cls_name for excluded in ("aircraft", "cockpit", "building")):
-					has_dynamic_camo = True
+			# [REMOVED in cleanup] per-material "does this model use dynamic camo?" gate  (material.py lines 1364-1369 of the pre-cleanup
+			#   file, inside MaterialTemplateLibrary.exportTextures, in the per-material loop right after mat.exportTextures()).
+			#   What it did: lower-cased mat.material.cls and set `has_dynamic_camo = True` when the class contained one of
+			#   "tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted" and none of "aircraft", "cockpit", "building".
+			#   Worked with: the `has_dynamic_camo` flag (below, removed too), which the original bake step used to decide whether to
+			#   bake at all. The same lists now live in CAMO_CLASS_KEYS / CAMO_CLASS_EXCLUDED and isCamoClass(), and the bake
+			#   step collects (diffuse, camo) pairs through getCamoPair(), so the flag was written but never read.
 
 			log.subLevel()
 
-		# Skip dynamic camo baking if model does not use dynamic camo
-		if not has_dynamic_camo:
+		# OBJ normal maps: decode the packed <n>.dds into <n>_obj.dds (what map_bump points at). The GLB export builds
+		# its own png (gltf_conv.make_gltf_normal) and never goes through this method.
+		for mat in SafeIter(self, self.__mats):
+			if mat.material.normal is not None:
+				normName = str(mat.material.normal).split("*")[0]
+				if normName.lower().endswith(".dds"):
+					normName = normName[:-4]
+				decodeNormalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+
+				if hasGlossMetal(normName, getattr(mat.material, "cls", None)):
+					decodeGlossMetalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+
+		# Collect every distinct (diffuse, camo) pair used by the model's materials
+		pairs = {}
+
+		for mat in SafeIter(self, self.__mats):
+			diffuse, camo = getCamoPair(mat.material)
+
+			if diffuse and camo:
+				pairs[bakedDiffuseName(diffuse, camo)] = (diffuse, camo)
+
+		if not pairs:
 			log.log("Model does not use dynamic camo; skipping camouflage baking step.")
 			log.subLevel()
 			return
 
-		# Build a mapping of diffuse texture to its paired camo texture from material parameters
-		diffuse_to_camo = {}
-		for mat in SafeIter(self, self.__mats):
-			params = mat.material.getParams()
-			t0 = params.get("t0") or mat.material.diffuse
-			t1 = params.get("t1") or params.get("camo_tex")
-			if not t1:
-				for s in mat.material.getTextureSlots()[1:]:
-					if s and "camo" in str(s).lower():
-						t1 = s
-						break
-			if t0 and t1:
-				t0_clean = str(t0).split("*")[0].lower()
-				t1_clean = str(t1).split("*")[0].lower()
-				if not t0_clean.endswith(".dds"):
-					t0_clean += ".dds"
-				if not t1_clean.endswith(".dds"):
-					t1_clean += ".dds"
-				diffuse_to_camo[t0_clean] = t1_clean
+		log.log(f"Baking {len(pairs)} diffuse/camo combination(s)")
 
-		textures_dir = path.join(outpath, "textures")
-		if path.exists(textures_dir):
-			try:
-				camo_files = [f for f in os.listdir(textures_dir) if "camo" in f.lower() and f.lower().endswith('.dds')]
-				
-				if camo_files:
-					from PIL import Image, ImageChops
-					import subprocess
-					from util.misc import ROOT_FOLDER
-					
-					texconv_path = path.join(ROOT_FOLDER, "texconv.exe")
-					if not path.exists(texconv_path):
-						texconv_path = "texconv.exe"
-
-					# Target base diffuse textures that have camo definitions, or all _c.dds if no explicit mapping
-					if diffuse_to_camo:
-						base_textures = [f for f in os.listdir(textures_dir) if f.lower() in diffuse_to_camo]
-					else:
-						base_textures = [f for f in os.listdir(textures_dir) if f.endswith('_c.dds') and "camo" not in f.lower()]
-
-					for base_f in base_textures:
-						base_dds = path.join(textures_dir, base_f)
-						
-						# Convert base DDS to PNG for Pillow manipulation
-						subprocess.run([texconv_path, "-y", "-ft", "png", "-o", textures_dir, base_dds], stdout=subprocess.DEVNULL)
-						base_png = path.splitext(base_dds)[0] + ".png"
-						if not path.exists(base_png):
-							continue
-
-						# Pick the matching camo texture from material mapping, by name match, or default to the first extracted camo file
-						matched_camo = None
-						if diffuse_to_camo and base_f.lower() in diffuse_to_camo:
-							target_camo = diffuse_to_camo[base_f.lower()]
-							for c_file in camo_files:
-								if c_file.lower() == target_camo:
-									matched_camo = c_file
-									break
-
-						if not matched_camo:
-							matched_camo = camo_files[0]
-							for c_file in camo_files:
-								c_stem = path.splitext(c_file)[0].lower()
-								# If a specific material camo exists for this texture, pair them
-								if c_stem in base_f.lower():
-									matched_camo = c_file
-									break
-
-						camo_dds = path.join(textures_dir, matched_camo)
-						subprocess.run([texconv_path, "-y", "-ft", "png", "-o", textures_dir, camo_dds], stdout=subprocess.DEVNULL)
-						camo_png = path.splitext(camo_dds)[0] + ".png"
-
-						if path.exists(camo_png):
-							base_img = Image.open(base_png).convert("RGBA")
-							camo_img = Image.open(camo_png).convert("RGB")
-
-							r, g, b, a = base_img.split()
-							base_rgb = Image.merge("RGB", (r, g, b))
-
-							w, h = base_img.size
-							cw, ch = camo_img.size
-							
-							# Tile the micro-detail camo pattern across the base texture resolution
-							tiled_camo = Image.new("RGB", (w, h))
-							for x in range(0, w, cw):
-								for y in range(0, h, ch):
-									tiled_camo.paste(camo_img, (x, y))
-
-							# Blend camo layer into the base diffuse texture
-							try:
-								composite = ImageChops.soft_light(base_rgb, tiled_camo)
-							except Exception:
-								composite = Image.composite(tiled_camo, base_rgb, a)
-
-							composite.save(base_png)
-							
-							# Re-encode composite PNG back to DDS format
-							subprocess.run([texconv_path, "-y", "-ft", "dds", "-o", textures_dir, base_png], stdout=subprocess.DEVNULL)
-
-							base_img.close()
-							camo_img.close()
-							composite.close()
-							
-							if path.exists(base_png):
-								os.remove(base_png)
-							if path.exists(camo_png):
-								os.remove(camo_png)
-
-					print("[INFO] Camouflage baking completed successfully.")
-			except Exception as e:
-				print(f"[WARNING] Automated baking routine encountered an issue: {e}")
+		try:
+			bakeCamoPairs(path.join(outpath, "textures"), pairs)
+		except Exception as e:
+			print(f"[WARNING] Automated baking routine encountered an issue: {e}")
 
 		log.subLevel()
 
@@ -1274,7 +1693,10 @@ def computeMaterialNames(mats:list[MaterialData], parent:Terminable = None):
 				continue
 			
 			if mat.getName() == mat2.getName():
-				if mat == mat2:
+				# MaterialData.__eq__ only compares the texture slots, so e.g. the canopy and the coloured lenses (all
+				# "dynamic_glass_chrome", no textures) counted as the same material and shared one name; Blender then merges
+				# the same-named materials into one. Equal means same slots AND same shader class, colour and parameters.
+				if mat == mat2 and mat.cls == mat2.cls and mat.diff == mat2.diff and mat.par == mat2.par:
 					continue
 				else:
 					mat2.setName(mat2.getName() + f"_{cnt}")

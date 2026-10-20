@@ -1,6 +1,12 @@
 import os
 import sys
 import argparse
+
+# A windowed (no console) build has no stdout / stderr: every print() would raise. Point them at nothing.
+if sys.stdout is None:
+  sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+  sys.stderr = open(os.devnull, "w", encoding="utf-8")
 import re
 from pathlib import Path
 import traceback

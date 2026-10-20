@@ -23,7 +23,14 @@ if not exist "texconv.exe" (
 if not exist ".venv\Scripts\python.exe" (
     py -3 -m venv .venv || goto :fail
     ".venv\Scripts\python.exe" -m pip install --upgrade pip
+    del ".venv\requirements.installed" 2>nul
+)
+
+:: (re)install the dependencies whenever requirements.txt changed since the last install
+fc /b "requirements.txt" ".venv\requirements.installed" >nul 2>&1
+if errorlevel 1 (
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt || goto :fail
+    copy /y "requirements.txt" ".venv\requirements.installed" >nul
 )
 
 start "" ".venv\Scripts\pythonw.exe" main.py

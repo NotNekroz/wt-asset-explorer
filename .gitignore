@@ -9,11 +9,12 @@ __pycache__/
 venv/
 env/
 ENV/
+.venv-build/
 
 # PyInstaller & Build Output
 build/
 dist/
-*.spec
+
 
 # War Thunder Caches & Local User Data
 .wt_asset_explorer/
@@ -38,3 +39,4 @@ Thumbs.db
 # Exclude wt_ext_cli.exe and texconv.exe
 wt_ext_cli.exe
 texconv.exe
+res/fonts/*.ttf

@@ -16,7 +16,8 @@ def getParentDir(filePath:str, level:int = 1):
 		return getParentDir(path.dirname(filePath), level - 1)
 
 if getattr(sys, "frozen", False):
-	ROOT_FOLDER = path.dirname(sys.executable)
+	# one-file build: the bundled texconv.exe / res folder are unpacked to sys._MEIPASS, not next to the .exe
+	ROOT_FOLDER = getattr(sys, "_MEIPASS", None) or path.dirname(sys.executable)
 else:
 	# [WTX patch] vendored layout is <root>/dae_core/util/misc.py -> root is 3 levels up
 	ROOT_FOLDER = os.environ.get("WTX_ROOT") or getParentDir(path.abspath(__file__), 3)
