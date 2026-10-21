@@ -2,12 +2,16 @@
 cd /d "%~dp0"
 
 if not exist "wt_ext_cli.exe" (
+    rem pinned build: the 64-bit Windows (x86_64-pc-windows-msvc) zip of wt_ext_cli v0.6.6. "latest + first *win* asset" could pick a build that does not run on x64 Windows (WinError 216)
     powershell -NoProfile -ExecutionPolicy Bypass -Command ^
         "$ErrorActionPreference = 'Stop';" ^
-        "$release = Invoke-RestMethod -Uri 'https://api.github.com/repos/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/latest';" ^
-        "$asset = $release.assets | Where-Object { $_.name -like '*win*' -or $_.name -like '*.exe' } | Select-Object -First 1;" ^
-        "if (-not $asset) { write-error 'No suitable executable asset found in latest release.'; exit 1; }" ^
-        "Invoke-WebRequest -Uri $asset.browser_download_url -OutFile 'wt_ext_cli.exe';" || goto :fail
+        "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12;" ^
+        "$zip = Join-Path $env:TEMP 'wt_ext_cli_x64.zip'; $dir = Join-Path $env:TEMP 'wt_ext_cli_x64';" ^
+        "Invoke-WebRequest -Uri 'https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/download/v0.6.6/wt_ext_cli-x86_64-pc-windows-msvc.zip' -OutFile $zip;" ^
+        "if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }; Expand-Archive -Path $zip -DestinationPath $dir -Force;" ^
+        "$exe = Get-ChildItem -Path $dir -Recurse -Filter 'wt_ext_cli.exe' | Select-Object -First 1;" ^
+        "if (-not $exe) { Write-Error 'wt_ext_cli.exe not found in the downloaded zip.'; exit 1; }" ^
+        "Copy-Item $exe.FullName 'wt_ext_cli.exe' -Force; Remove-Item $zip, $dir -Recurse -Force;" || goto :fail
 )
 
 if not exist "texconv.exe" (
