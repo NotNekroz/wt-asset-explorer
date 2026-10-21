@@ -666,7 +666,21 @@ class MaterialData(Terminable):
 		self.__detailList:list[str] = None
 		self.__detailNormalList:list[str, None] = None
 		self.__textureSlots:list[str] = [None for _ in range(11)]
-		self.textures:list[str] = []
+		self._rawTextures:list[str] = []
+	
+	@property
+	def textures(self) -> list[str]:
+		"""The material's textures as the game loads them on the current vehicle (see swapVehicleTex)."""
+		out = [swapVehicleTex(t) for t in self._rawTextures]
+
+		if FIXED_SKIN_OVERLAYS:
+			for t in list(out):
+				extra = FIXED_SKIN_OVERLAYS.get(str(t).split("*")[0].lower()) if isinstance(t, str) else None
+
+				if extra and extra not in out:
+					out.append(extra)
+
+		return out
 	
 	def isLayered(self):
 		return self.cls.find("layered") != -1
@@ -675,7 +689,7 @@ class MaterialData(Terminable):
 		return self.cls.find("dynamic") != -1
 	
 	def __generateName__(self):
-		if len(self.textures) == 0:
+		if len(self._rawTextures) == 0:
 			return self.cls
 		
 		components:list[str] = []
@@ -715,7 +729,7 @@ class MaterialData(Terminable):
 		slotIdx = int(slotName[1:])
 
 		self.__textureSlots[slotIdx] = tex
-		self.textures.append(tex)
+		self._rawTextures.append(tex)
 	
 	def getName(self):
 		if self.__name is None:
@@ -748,7 +762,7 @@ class MaterialData(Terminable):
 		return self.__params
 
 	def getTextureSlots(self):
-		return self.__textureSlots
+		return [swapVehicleTex(t) for t in self.__textureSlots]
 
 	def convertTex(self, texture: str, data: bytes, texturePaths: TexturePathDict = None, forceConvert: bool = False,
 				   texN: str = None):
@@ -826,7 +840,7 @@ class MaterialData(Terminable):
 		makedirs(outpath, exist_ok=True)
 
 		if key.endswith("_n"):
-			for stale in (f"{name}_obj.dds", f"{name}_gltf.png", f"{name}_mr.png", f"{name}_rough.png", f"{name}_metal.png"):
+			for stale in (f"{name}_obj.dds", f"{name}_gltf.png", f"{name}_mr.png", f"{name}_rough.png", f"{name}_metal.png", f"{name}_rough_s.png", f"{name}_metal_s.png", f"{name}_normal_s.png"):
 				try:
 					os.remove(path.join(outpath, stale))
 				except OSError:
@@ -835,7 +849,6 @@ class MaterialData(Terminable):
 			# The exporters read a normal map in the layout of the game's own ones: X in alpha, Y in green. Say what the skin's file holds, so a
 			# normal map saved in another layout (plain RGB, alpha all 255) is visible in the log instead of just "not working".
 			rng = lambda c: f"{int(arr[..., c].min())}-{int(arr[..., c].max())}"
-			print(f"[skin] normal map {path.basename(src)} ({arr.shape[1]}x{arr.shape[0]}): red {rng(0)}, green {rng(1)}, alpha {rng(3)}")
 
 			if arr[..., 3].min() == arr[..., 3].max():
 				print(f"[skin] WARNING {path.basename(src)}: the alpha channel is one flat value. The preview reads the normal's X from alpha (the layout "
@@ -856,9 +869,7 @@ class MaterialData(Terminable):
 			except Exception as e:
 				print(f"[skin] WARNING {name}: GLB normal map failed: {type(e).__name__}: {e}")
 
-			if path.exists(png):
-				print(f"[skin] {name}_gltf.png built from the skin's normal map")
-			else:
+			if not path.exists(png):
 				print(f"[skin] WARNING {name}: no {name}_gltf.png was produced from {path.basename(src)}; the GLB will point at the raw .dds instead")
 				try:
 					Image.open(raw).load()
@@ -883,7 +894,9 @@ class MaterialData(Terminable):
 				print(f"[WARNING] Skin texture {path.basename(skinSrc)} not used ({type(e).__name__}: {e}); extracting the game's {texture} instead")
 
 		# The same texture is requested by several materials / slots; converting + writing it again is pure waste.
-		doneKey = (path.abspath(path.join(outpath, str(texture).split("*")[0] + ".dds")), forceConvert, texN)
+		# texN equal to the plain name is the same request as texN None (same file, same conversion)
+		doneKey = (path.abspath(path.join(outpath, str(texture).split("*")[0] + ".dds")), forceConvert,
+		           None if texN == str(texture).split("*")[0] else texN)
 
 		if doneKey in MaterialData._exportedTextures and path.exists(doneKey[0]):
 			return
@@ -1150,6 +1163,68 @@ def decodeNormalForGltf(ddsPath: str):
 		print(f"[WARNING] Could not decode normal map {ddsPath}: {e}")
 		return None
 
+# [obj] The OBJ's map_Bump uses the GLB's own picture, <n>_gltf.png (decodeNormalForGltf above), so both exports shade from the very same
+# file. False = the OBJ-only uncompressed <n>_obj.dds (same pixels, written by decodeNormalForObj below).
+OBJ_NORMAL_GLTF_PNG = True
+# Blender's OBJ importer sets the Normal Map node's strength from the -bm option of map_Bump and leaves it at 0.000 without one, which
+# switches the normal map off. None = write no option (old behaviour).
+OBJ_BUMP_STRENGTH = 1.0
+
+# [obj-srgb] Blender's OBJ importer loads the normal, roughness and metal pictures as sRGB colour (a .mtl cannot say "Non-Color"; the GLB
+# importer sets Non-Color itself). Read as colour, a roughness of 0.55 becomes 0.26 and the whole tank turns shiny, and the normals tilt wrong.
+# With this switch the OBJ's three pictures are written PRE-ENCODED (linear value -> sRGB code), so Blender's sRGB decode gives back exactly the
+# values the GLB uses. They get their own names (<n>_rough_s.png, <n>_metal_s.png, <n>_normal_s.png) and the GLB's files are untouched.
+# False = the old files, which need Non-Color set by hand in Blender.
+OBJ_SRGB_PREENCODE = True
+
+_SRGB_LUT = []
+
+def srgbEncodeU8(arr):
+	"""uint8 array of linear values (0..255 = 0..1) -> uint8 sRGB codes of the same values (the standard sRGB transfer curve)."""
+	import numpy as np
+
+	if not _SRGB_LUT:
+		x = np.arange(256, dtype=np.float64) / 255.0
+		y = np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+		_SRGB_LUT.append(np.clip(np.rint(y * 255.0), 0, 255).astype(np.uint8))
+
+	return _SRGB_LUT[0][arr]
+
+def objRoughSuffix() -> str:
+	return "_rough_s.png" if OBJ_SRGB_PREENCODE else "_rough.png"
+
+def objMetalSuffix() -> str:
+	return "_metal_s.png" if OBJ_SRGB_PREENCODE else "_metal.png"
+
+def objNormalFile(normName: str) -> str:
+	if OBJ_SRGB_PREENCODE:
+		return normName + "_normal_s.png"
+
+	return normName + ("_gltf.png" if OBJ_NORMAL_GLTF_PNG else "_obj.dds")
+
+def decodeNormalForObjSrgb(ddsPath: str):
+	"""<n>_normal_s.png: the GLB's <n>_gltf.png (same decode) pre-encoded for Blender's sRGB reading of the OBJ's map_Bump."""
+	try:
+		import numpy as np
+		dst = path.splitext(ddsPath)[0] + "_normal_s.png"
+		src = decodeNormalForGltf(ddsPath)
+
+		if src is None or not path.exists(src):
+			return None
+
+		if path.exists(dst) and path.getmtime(dst) >= path.getmtime(src):
+			return dst
+
+		img = Image.open(src).convert("RGB")
+		arr = np.asarray(img)
+		img.close()
+		Image.fromarray(np.ascontiguousarray(srgbEncodeU8(arr)), "RGB").save(dst, compress_level=1)
+
+		return dst
+	except Exception as e:
+		print(f"[WARNING] Could not build the sRGB-encoded normal map of {ddsPath} for the OBJ: {e}")
+		return None
+
 # [obj] Same decode as decodeNormalForGltf, but written as an UNCOMPRESSED .dds (<n>_obj.dds) for the OBJ/MTL path.
 # Blender's OBJ importer feeds map_Bump into a Normal Map node, which expects plain RGB tangent-space normals; the game's
 # packed original (X in alpha, Y in green, red = other data) therefore shades wrongly. The original <n>.dds is NOT touched.
@@ -1205,12 +1280,9 @@ GLOSS_SMOOTH_SCALE = 0.78  # red (smoothness) is multiplied by this before it be
 GLOSS_METAL_SCALE = 1.0    # blue (metalness) is multiplied by this; lower = less metal. 0 = no metal at all
 
 def glossMetalMaps(arr, label: str = ""):
-	"""The _n texture's RGBA array -> (roughness, metalness) as uint8 pictures, the one place both exporters take them from.
-	Also logs the range of the two channels, so a too shiny / too dull result can be traced to the data."""
+	"""The _n texture's RGBA array -> (roughness, metalness) as uint8 pictures, the one place both exporters take them from."""
 	import numpy as np
 	red, blue = arr[..., 0], arr[..., 2]
-	print(f"[gloss] {label}: smoothness (red) {int(red.min())}-{int(red.max())} mean {float(red.mean()):.0f}, "
-	      f"metal (blue) {int(blue.min())}-{int(blue.max())} mean {float(blue.mean()):.0f}")
 	smooth = np.clip(red.astype(np.float32) * GLOSS_SMOOTH_SCALE, 0, 255)
 	metal = np.clip(blue.astype(np.float32) * GLOSS_METAL_SCALE, 0, 255)
 	return (255.0 - smooth + 0.5).astype(np.uint8), (metal + 0.5).astype(np.uint8)
@@ -1219,7 +1291,7 @@ def decodeGlossMetalForObj(ddsPath: str):
 	try:
 		import numpy as np
 		base = path.splitext(ddsPath)[0]
-		rough, metal = base + "_rough.png", base + "_metal.png"
+		rough, metal = base + objRoughSuffix(), base + objMetalSuffix()
 
 		if not path.exists(ddsPath):
 			return None
@@ -1237,6 +1309,10 @@ def decodeGlossMetalForObj(ddsPath: str):
 			img.close()
 
 		roughArr, metalArr = glossMetalMaps(arr, path.basename(base))
+
+		if OBJ_SRGB_PREENCODE:    # Blender reads these as sRGB colour: write the codes that decode to the GLB's values
+			roughArr, metalArr = srgbEncodeU8(roughArr), srgbEncodeU8(metalArr)
+
 		Image.fromarray(np.ascontiguousarray(roughArr), "L").save(rough, compress_level=1)
 		Image.fromarray(np.ascontiguousarray(metalArr), "L").save(metal, compress_level=1)
 
@@ -1270,7 +1346,209 @@ OBJ_GLASS_NS = 900.0                 # shininess (Blender roughness ~ 1 - sqrt(N
 # So the baked result is stored once per (diffuse, camo) pair as "<diffuse>__<camo>.dds" and every
 # material's map_Kd points at its own pair. The original <diffuse>.dds is never overwritten.
 CAMO_CLASS_KEYS = ("tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted", "dynamic_camo")
+# "_net_": camouflage nets (dynamic_tank_net_atest). The new net shader takes the net's colour from the camo the whole vehicle wears
+# (CDK wiki, "Working with Camouflage Nets"). Their diffuse alpha is the net's cut-out, not a paint mask, so they are baked in
+# their own way (see bakeCamoPairs, net mode) that keeps the alpha. NET_CAMO_BAKE = False brings the old behaviour back:
+# nets keep their raw picture.
+NET_CAMO_BAKE = True
+NET_CLASS_KEY = "_net_"
 CAMO_CLASS_EXCLUDED = ("aircraft", "cockpit", "building")
+_NET_DIFFUSES = set()      # lower-case diffuse names used by a net material; filled by getCamoPair, read by bakeCamoPairs
+# Lower-case diffuse names used by an alpha-tested or alpha-blended material (filled by getCamoPair, read by bakeCamoPairs). Only those
+# baked pictures keep an alpha channel. For every other class the diffuse's alpha is the camo PAINT MASK, which no exporter reads as
+# opacity (GLB: OPAQUE), but Blender's "Straight" alpha mode (what the OBJ importer sets) multiplies the colour by it and turns every
+# unpainted texel black (the black cracks / black lenses). OPAQUE_BAKE_FOR_MASK_ALPHA = False brings the old behaviour back.
+OPAQUE_BAKE_FOR_MASK_ALPHA = True
+_ALPHA_DIFFUSES = set()
+DIAG_LINES = []            # diagnostic lines of one export; wtx/assets.py prints them together at the end of the log
+
+def diag(msg):
+	DIAG_LINES.append(str(msg))
+
+NET_NODES = set()          # lower-case names of the net meshes, from the vehicle BLK's camouflage_net block (set by wtx/assets.py)
+
+def setNetNodes(nodes):
+	NET_NODES.clear()
+	NET_NODES.update({str(n).lower() for n in (nodes or [])})
+
+NET_PAINTED_MASKS = {}     # lower-case diffuse -> bool UV-space mask of the texels used only by ordinary (non-net) meshes; set by gltf_conv
+
+def setNetPaintedMasks(masks: dict):
+	"""Texels of a net diffuse that only ordinary parts use (the AA gun mount, wheels...) are painted like any other camo class
+	(diffuse alpha = paint mask) instead of getting the net shading. Empty = every texel is treated as net, the way it was."""
+	NET_PAINTED_MASKS.clear()
+	NET_PAINTED_MASKS.update({str(k).lower(): v for k, v in (masks or {}).items()})
+
+NET_ALPHA_CUTOFF = 0.25    # same value as gltf_conv.NET_ALPHA_CUTOFF (a net is a fine weave of half transparent pixels)
+
+def alphaTestCutoff(material):
+	"""The alpha-test reference the GLB export gives this material (gltf_conv): None when its class is not an *atest* one.
+	The material's own `atest` parameter when it has one (0..255 or 0..1), else 127/255; camouflage nets use NET_ALPHA_CUTOFF."""
+	cls = str(getattr(material, "cls", "") or "").lower()
+
+	if "atest" not in cls:
+		return None
+
+	cutoff = 127.0 / 255.0
+
+	try:
+		ref = material.getParams().get("atest")
+
+		if ref is not None:
+			v = float(ref)
+			v = v / 255.0 if v > 1.0 else v
+			cutoff = min(max(v, 0.0), 1.0)
+	except Exception:
+		pass
+
+	if NET_CLASS_KEY in cls:
+		cutoff = NET_ALPHA_CUTOFF
+
+	return cutoff
+
+BLENDER_SHADING_SCRIPT = '"""Blender: gives the materials of the OBJ you just imported the same shading the GLB export has.\nWritten by wt-asset-explorer next to the .obj. Import the .obj first, SELECT its objects, then Scripting > Open this file > Run Script.\n(With nothing selected it works on the materials listed below.)\n\nWhat it does, per material:\n  * alpha-tested materials (nets, chains, foliage ...): the image\'s alpha goes through "Less Than <cutoff>" and "1 - x" into Alpha\n    (a hard cut-out, the GLB\'s Alpha Clip), the separate alpha image the importer made is dropped, blend mode = clip\n  * roughness / metallic / normal images are set to Non-Color, the Normal Map strength to 1\nMaterials it does not know are left alone, except that an alpha link the importer made gets the default cutoff 0.5."""\nimport bpy, re\n\nCUTOFFS = __DATA__    # material name -> alpha-test cutoff (None = not alpha-tested)\nDEFAULT_CUTOFF = 0.5\nFIX_COLORSPACE = __FIX__    # False when the rough/metal/normal pictures are pre-encoded for sRGB: Non-Color would break them\n\n\ndef key(name):\n    return re.sub(r"\\.\\d{3}$", "", name)\n\n\ndef source(sock):\n    for link in sock.links:\n        return link.from_node\n    return None\n\n\ndef noncolor(node):\n    if FIX_COLORSPACE and node is not None and node.bl_idname == "ShaderNodeTexImage" and node.image is not None:\n        node.image.colorspace_settings.name = "Non-Color"\n\n\ndef fix(mat):\n    if not mat.use_nodes or mat.node_tree is None:\n        return False\n    nt = mat.node_tree\n    bsdf = next((n for n in nt.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled"), None)\n    if bsdf is None:\n        return False\n    for name in ("Metallic", "Roughness"):\n        noncolor(source(bsdf.inputs[name]))\n    nm = source(bsdf.inputs["Normal"])\n    if nm is not None and nm.bl_idname == "ShaderNodeNormalMap":\n        nm.space = "TANGENT"\n        nm.inputs["Strength"].default_value = 1.0\n        noncolor(source(nm.inputs["Color"]))\n\n    cutoff = CUTOFFS.get(key(mat.name))\n    alpha_in = bsdf.inputs["Alpha"]\n    old_alpha = source(alpha_in)\n    if cutoff is None and old_alpha is not None:\n        cutoff = DEFAULT_CUTOFF\n    if cutoff is None:\n        return True\n    base = source(bsdf.inputs["Base Color"])\n    if base is None or base.bl_idname != "ShaderNodeTexImage":\n        base = old_alpha if old_alpha is not None and old_alpha.bl_idname == "ShaderNodeTexImage" else None\n    if base is None:\n        return True\n    for link in list(alpha_in.links):\n        nt.links.remove(link)\n    if old_alpha is not None and old_alpha is not base and old_alpha.bl_idname == "ShaderNodeTexImage":\n        nt.nodes.remove(old_alpha)                       # the importer\'s separate alpha image\n    base.image.alpha_mode = "CHANNEL_PACKED"\n    less = nt.nodes.new("ShaderNodeMath")\n    less.operation = "LESS_THAN"\n    less.inputs[1].default_value = float(cutoff)\n    px, py = base.location.x + 400, base.location.y - 200\n    less.location = (px, py)\n    sub = nt.nodes.new("ShaderNodeMath")\n    sub.operation = "SUBTRACT"\n    sub.inputs[0].default_value = 1.0\n    sub.location = (px + 200, py)\n    nt.links.new(base.outputs["Alpha"], less.inputs[0])\n    nt.links.new(less.outputs[0], sub.inputs[1])\n    nt.links.new(sub.outputs[0], alpha_in)\n    if hasattr(mat, "surface_render_method"):\n        mat.surface_render_method = "DITHERED"\n    if hasattr(mat, "blend_method"):\n        try:\n            mat.blend_method = "CLIP"\n        except (TypeError, ValueError):\n            pass\n    mat.use_backface_culling = False\n    return True\n\n\nmats = []\nfor ob in bpy.context.selected_objects:\n    for slot in getattr(ob, "material_slots", []):\n        if slot.material is not None and slot.material not in mats:\n            mats.append(slot.material)\nif not mats:\n    mats = [m for m in bpy.data.materials if key(m.name) in CUTOFFS]\ndone = [m.name for m in mats if fix(m)]\nprint("wt shading: %d material(s) updated: %s" % (len(done), ", ".join(done)))\n'
+
+def writeBlenderShading(scriptPath, materials):
+	"""Writes the Blender script that gives an imported OBJ the GLB's shading (alpha clip, Non-Color maps, normal strength)."""
+	import pprint
+
+	data = {}
+
+	for m in materials or ():
+		try:
+			data[m.getName()] = alphaTestCutoff(m)
+		except Exception:
+			pass
+
+	with open(scriptPath, "w", encoding="utf-8", newline="\n") as fh:
+		fh.write(BLENDER_SHADING_SCRIPT.replace("__DATA__", pprint.pformat(data, width=100)).replace("__FIX__", str(not OBJ_SRGB_PREENCODE)))
+
+NET_MASK_RES = 2048        # resolution of the UV-space masks (the bake resizes them to the texture's size)
+
+def buildNetPaintedMasks(mdl):
+	"""{lower-case net diffuse: bool mask} of the texels that only ordinary (non-net) meshes use, for a loaded model. This is the
+	same classification the glTF export does while it writes its meshes (gltf_conv): a mesh is a net when the vehicle BLK lists it
+	in camouflage_net (NET_NODES), without that block when it is skinned or has "net" in its name. The OBJ export calls it before
+	it bakes, so the net atlas gets the same treatment as in the GLB. Empty dict = every texel of a net diffuse is net."""
+	import math
+	import numpy as np
+	from PIL import ImageDraw
+
+	pairs, byName = {}, {}
+
+	for idx, m in enumerate(getattr(mdl, "materials", None) or []):
+		if NET_CLASS_KEY not in str(getattr(m, "cls", "") or "").lower():
+			continue
+
+		diffuse, camo = getCamoPair(m)
+
+		if diffuse and camo:
+			pairs[idx] = diffuse
+			byName.setdefault(m.getName(), diffuse)
+
+	if not pairs:
+		return {}
+
+	layers = {}   # diffuse (lower) -> [net image, ordinary image, net draw, ordinary draw]
+
+	for obj in mdl:
+		faces = obj.faces
+		nFaces = len(faces)
+
+		if nFaces == 0 or not obj.materials:
+			continue
+
+		name = obj.name.lower()
+		isNet = (name in NET_NODES) if NET_NODES else (bool(getattr(obj, "skinned", False)) or "net" in name)
+		starts = sorted(obj.materials.keys())
+		ids = getattr(obj, "material_ids", {})
+
+		for i, first in enumerate(starts):
+			end = min(starts[i + 1] if i + 1 < len(starts) else nFaces, nFaces)
+
+			if end <= first:
+				continue
+
+			mid = ids.get(first)
+			diffuse = pairs.get(mid) if mid is not None else None
+
+			if diffuse is None:
+				diffuse = byName.get(obj.materials.get(first))
+
+			if diffuse is None:
+				continue
+
+			key = str(diffuse).lower()
+
+			if key not in layers:
+				ni, oi = Image.new("L", (NET_MASK_RES, NET_MASK_RES), 0), Image.new("L", (NET_MASK_RES, NET_MASK_RES), 0)
+				layers[key] = [ni, oi, ImageDraw.Draw(ni), ImageDraw.Draw(oi)]
+
+			draw = layers[key][2 if isNet else 3]
+
+			for f in faces[first:end]:
+				pts = []
+
+				for vId in f:
+					uv = mdl.getUV(int(vId))
+					pts.append((float(uv[0]), 1.0 - float(uv[1])))   # the bake's image rows run top-down, source UVs bottom-up
+
+				ou = math.floor(min(p[0] for p in pts) + 1e-6)
+				ov = math.floor(min(p[1] for p in pts) + 1e-6)
+				draw.polygon([((p[0] - ou) * (NET_MASK_RES - 1), (p[1] - ov) * (NET_MASK_RES - 1)) for p in pts], fill=255, outline=255)
+
+	masks = {}
+
+	for key, (ni, oi, _a, _b) in layers.items():
+		net = np.asarray(ni) > 0
+		ordinary = (np.asarray(oi) > 0) & ~net
+
+		if ordinary.any():
+			masks[key] = ordinary
+
+	return masks
+
+# [vehicle camo] ------------------------------------------------------------------------------------------------
+# A vehicle's BLK (units/tankmodels/<id>.blk, block default_skin) swaps the textures its model asks for: for the Wolfpack
+# replace_tex from "us_camo_olive*" to "us_camo_modern_green*". The materials still list the placeholder camo; the game
+# shows the swapped one. wtx/assets.py reads that block and calls setVehicleTexSwaps() for the duration of an export. The
+# swap is applied when a material's textures are READ (textures / getTextureSlots / swapVehicleTex), never stored, so a
+# cached model is not tied to the vehicle it was first exported for.
+VEHICLE_TEX_SWAPS = {}      # clean lower-case texture name -> replacement as the BLK writes it ("us_camo_modern_green*")
+VEHICLE_SWAPS_USED = set()  # (from, to) pairs that were actually applied to a material of this export
+
+def setVehicleTexSwaps(mapping: dict):
+	VEHICLE_TEX_SWAPS.clear()
+	VEHICLE_SWAPS_USED.clear()
+	VEHICLE_TEX_SWAPS.update({str(k).split("*")[0].lower(): str(v) for k, v in (mapping or {}).items() if k and v})
+
+def clearVehicleTexSwaps():
+	VEHICLE_TEX_SWAPS.clear()
+
+# [fixed skin] ---------------------------------------------------------------------------------------------------
+# default_skin { set_tex { from to param:t = "camo_skin_tex" } }: a fixed skin picture for the body / turret / gun (Type 90:
+# type_90_body_c -> type_90_skin_ll_body_c). It is NOT a finished texture: its alpha says where it shows (CDK wiki, creation_camo:
+# white alpha covers the scalable camo, black lets it through), so everything else stays as the normal camo bake. The material keeps
+# its own diffuse; the skin is extracted next to it (textures) and laid over the baked result by its alpha (bakeCamoPairs).
+FIXED_SKIN_OVERLAYS = {}    # clean lower-case diffuse -> skin picture as the BLK writes it ("type_90_skin_ll_body_c*")
+
+def setFixedSkinOverlays(mapping: dict):
+	FIXED_SKIN_OVERLAYS.clear()
+	FIXED_SKIN_OVERLAYS.update({str(k).split("*")[0].lower(): str(v) for k, v in (mapping or {}).items() if k and v})
+
+def swapVehicleTex(tex):
+	"""The texture the game really loads for `tex` on the current vehicle (unchanged when the BLK does not swap it)."""
+	if not VEHICLE_TEX_SWAPS or not tex or not isinstance(tex, str):
+		return tex
+
+	base = tex.split("*")[0]
+	new = VEHICLE_TEX_SWAPS.get(base.lower())
+
+	if new is None:
+		return tex
+
+	VEHICLE_SWAPS_USED.add((base, new.split("*")[0]))
+	return new if ("*" in new or "*" not in tex) else new + "*"
 
 # [skin preview] ------------------------------------------------------------------------------------------------
 # While a custom-skin preview is exported, SKIN_OVERRIDES maps a game texture name (lower case) to the picture the skin
@@ -1320,6 +1598,10 @@ def _loadSkinRgba(src: str):
 
 def isCamoClass(cls) -> bool:
 	cls = str(cls).lower()
+
+	if NET_CLASS_KEY in cls and not NET_CAMO_BAKE:
+		return False
+
 	return any(k in cls for k in CAMO_CLASS_KEYS) and not any(x in cls for x in CAMO_CLASS_EXCLUDED)
 
 def getCamoPair(material):
@@ -1332,6 +1614,11 @@ def getCamoPair(material):
 	diffuse = str(diffuse).split("*")[0]
 	camo = None
 
+	_cls = str(getattr(material, "cls", "") or "").lower()
+
+	if "atest" in _cls or "alpha_blend" in _cls:
+		_ALPHA_DIFFUSES.add(diffuse.lower())
+
 	if skinOverride(diffuse) is not None:
 		return diffuse, None      # the skin supplies the finished picture: no camo is baked into it
 
@@ -1340,6 +1627,9 @@ def getCamoPair(material):
 			if idx > 0 and slot and "camo" in str(slot).lower():
 				camo = str(slot).split("*")[0]
 				break
+
+		if camo and NET_CLASS_KEY in str(material.cls).lower():
+			_NET_DIFFUSES.add(diffuse.lower())
 
 	return diffuse, camo
 
@@ -1437,9 +1727,38 @@ def _loadDdsArray(ddsPath: str, tmpDir: str):
 	img = _loadDdsImage(ddsPath, tmpDir)
 	return np.asarray(img) if img is not None else None
 
+def _bakeNetColour(baseRgb, alpha, camoTiled):
+	"""Colour of a camouflage net (or the cloth under it): the camo, multiplied by the picture's brightness relative to its own
+	average, then mixed with the picture's own colour by the diffuse alpha (the camo amount).
+	The average is taken over the visible pixels (alpha-weighted), so the net's mean colour is the camo's and the weave only
+	adds its light / dark structure. No colour constants: everything comes from the two textures."""
+	import numpy as np
+
+	h, w = alpha.shape
+	weights = alpha.astype(np.float64) / 255.0
+	lum = baseRgb[..., 0] * 0.299 + baseRgb[..., 1] * 0.587 + baseRgb[..., 2] * 0.114
+	total = weights.sum()
+	mean = float((lum * weights).sum() / total) if total > 0 else float(lum.mean())
+
+	out = np.empty((h, w, 3), np.uint8)
+	step = 512   # rows per chunk: a 4096x2048 float image would take ~100 MB in one piece
+
+	for y in range(0, h, step):
+		camo = camoTiled[y:y + step].astype(np.float32)
+		shaded = camo * (lum[y:y + step] / mean).astype(np.float32)[..., None] if mean >= 1.0 else camo
+		# The diffuse alpha is the amount of camo, the way the game's other camo classes read it. A net weave has alpha 0 or
+		# 255 (the cut-out), so it comes out fully camo. A cloth under a net has a graded alpha: it keeps its own colour where
+		# the alpha is low (the torn hems) and takes the camo where it is high.
+		a = (weights[y:y + step].astype(np.float32))[..., None]
+		blended = shaded * a + baseRgb[y:y + step].astype(np.float32) * (1.0 - a)
+		out[y:y + step] = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+
+	return out
+
 def bakeCamoPairs(texturesDir: str, pairs: dict):
 	"""pairs = {bakedName: (diffuse, camo)}. Writes textures/<bakedName>.dds for every pair."""
 	import numpy as np
+	import time as _time
 
 	texconv = _findTexconv()
 	hasTexconv = path.exists(texconv) or shutil.which(texconv) is not None
@@ -1450,6 +1769,7 @@ def bakeCamoPairs(texturesDir: str, pairs: dict):
 		tileCache = {}  # (camo, w, h) -> tiled rgb ndarray
 
 		for bakedName, (diffuse, camo) in pairs.items():
+			_t0 = _time.perf_counter()
 			baseDds = path.join(texturesDir, diffuse + ".dds")
 			camoDds = path.join(texturesDir, camo + ".dds")
 
@@ -1472,6 +1792,7 @@ def bakeCamoPairs(texturesDir: str, pairs: dict):
 				print(f"[WARNING] Camo bake skipped for {bakedName}: could not decode textures")
 				continue
 
+			_t1 = _time.perf_counter()     # textures decoded
 			baseRgb, alpha = base
 			h, w = alpha.shape
 			ch, cw = camoArr.shape[:2]
@@ -1485,12 +1806,54 @@ def bakeCamoPairs(texturesDir: str, pairs: dict):
 
 			tiled = tileCache[key]
 
-			# The diffuse's ALPHA is the paint mask (white = painted hull/superstructure, black = bare metal/details).
-			# Painted areas take the camo colour, unpainted areas keep the base colour (rust, grime, waterline growth).
-			a = alpha[..., None].astype(np.uint16)
-			out = ((tiled.astype(np.uint16) * a + baseRgb.astype(np.uint16) * (255 - a) + 127) // 255).astype(np.uint8)
-			composite = Image.fromarray(out, "RGB")
+			if NET_CAMO_BAKE and diffuse.lower() in _NET_DIFFUSES:
+				# Camouflage net: the colour comes from the camo, the diffuse supplies only the weave's light and dark. Its alpha is
+				# the cut-out (kept below), not a paint mask.
+				out = _bakeNetColour(baseRgb, alpha, tiled)
+				ordinary = NET_PAINTED_MASKS.get(diffuse.lower())
+				if ordinary is not None:
+					# Ordinary parts on the net atlas: the tank's camo through the diffuse's paint mask, like every other camo class.
+					sel = np.asarray(Image.fromarray(ordinary.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)) > 0
+					a2 = alpha[..., None].astype(np.uint16)
+					painted = ((tiled.astype(np.uint16) * a2 + baseRgb.astype(np.uint16) * (255 - a2) + 127) // 255).astype(np.uint8)
+					out[sel] = painted[sel]
+			else:
+				# The diffuse's ALPHA is the paint mask (white = painted hull/superstructure, black = bare metal/details).
+				# Painted areas take the camo colour, unpainted areas keep the base colour (rust, grime, waterline growth).
+				a = alpha[..., None].astype(np.uint16)
+				out = ((tiled.astype(np.uint16) * a + baseRgb.astype(np.uint16) * (255 - a) + 127) // 255).astype(np.uint8)
 
+				# Fixed skin (set_tex camo_skin_tex): its picture covers the camo where its alpha is white, the camo shows where it is black.
+				skinName = FIXED_SKIN_OVERLAYS.get(diffuse.lower())
+
+				if skinName:
+					skinName = skinName.split("*")[0]
+					skinDds = path.join(texturesDir, skinName + ".dds")
+					skinArr = _loadDdsArray(skinDds, tmp) if path.exists(skinDds) else None
+
+					if skinArr is None:
+						print(f"[WARNING] Fixed skin {skinName} not available for {bakedName}: the normal camo bake is kept")
+					else:
+						if skinArr.shape[0] != h or skinArr.shape[1] != w:
+							skinArr = np.asarray(Image.fromarray(np.ascontiguousarray(skinArr), "RGBA").resize((w, h), Image.BILINEAR))
+
+						sa = skinArr[..., 3:4].astype(np.uint16)
+						out = ((skinArr[..., :3].astype(np.uint16) * sa + out.astype(np.uint16) * (255 - sa) + 127) // 255).astype(np.uint8)
+
+			# Keep the diffuse's alpha in the baked picture whenever it is not all opaque. On an alpha-tested material (nets, foliage,
+			# chains: the glTF "MASK" mode) that alpha is what cuts the holes out; an RGB-only bake turned those into solid sheets.
+			# Opaque materials ignore it (glTF OPAQUE), and the camo mask above is still read from it, so nothing else changes.
+			keepAlpha = int(alpha.min()) < 255
+
+			if keepAlpha and OPAQUE_BAKE_FOR_MASK_ALPHA and diffuse.lower() not in _ALPHA_DIFFUSES and diffuse.lower() not in _NET_DIFFUSES:
+				keepAlpha = False     # the alpha is only the camo paint mask (used above): the baked picture is opaque
+
+			if keepAlpha:
+				composite = Image.fromarray(np.dstack((out, alpha)), "RGBA")
+			else:
+				composite = Image.fromarray(out, "RGB")
+
+			_t2 = _time.perf_counter()     # colours computed
 			outDds = path.join(texturesDir, bakedName + ".dds")
 
 			if path.exists(outDds):
@@ -1503,7 +1866,7 @@ def bakeCamoPairs(texturesDir: str, pairs: dict):
 			if hasTexconv:
 				try:
 					outPng = path.join(tmp, bakedName + ".png")
-					composite.save(outPng)
+					composite.save(outPng, compress_level=1)   # temp file for texconv: lossless at any level, level 1 is several times faster
 					subprocess.run([texconv, "-y", "-ft", "dds", "-o", texturesDir, outPng],
 								   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 				except Exception:
@@ -1512,7 +1875,6 @@ def bakeCamoPairs(texturesDir: str, pairs: dict):
 			if not path.exists(outDds):
 				composite.save(outDds, format="DDS")
 
-			print(f"[INFO] Baked {bakedName}.dds")
 
 class MaterialTemplateLibrary(Terminable):
 	class Material(Terminable):
@@ -1554,18 +1916,21 @@ class MaterialTemplateLibrary(Terminable):
 			if diffuse_name is not None:
 				self.setParam("map_Kd", "textures/" + bakedDiffuseName(diffuse_name, camo_name) + ".dds")
 
+				if alphaTestCutoff(material) is not None:
+					# alpha-tested class (nets, chains, foliage ...): the picture's alpha is the cut-out, the GLB uses it as an alpha test
+					self.setParam("map_d", "textures/" + bakedDiffuseName(diffuse_name, camo_name) + ".dds")
+
 			if material.normal is not None:
 				norm_tex = str(material.normal).split("*")[0]
-				# OBJ: the decoded RGB normal map <n>_obj.dds written by decodeNormalForObj(). Only the GLB uses
-				# <n>_gltf.png, which gltf_conv.make_gltf_normal() builds itself.
+				# OBJ: the decoded RGB normal map, the GLB's own <n>_gltf.png (objNormalFile; <n>_obj.dds when OBJ_NORMAL_GLTF_PNG is off).
 				if norm_tex.lower().endswith(".dds"):
 					norm_tex = norm_tex[:-4]
-				self.setParam("map_bump", "textures/" + norm_tex + "_obj.dds")
+				self.setParam("map_bump", (f"-bm {OBJ_BUMP_STRENGTH:g} " if OBJ_BUMP_STRENGTH is not None else "") + "textures/" + objNormalFile(norm_tex))
 
 				# Gloss (red) and metal (blue) of the same _n: Blender reads map_Pr / map_Pm. Written by decodeGlossMetalForObj().
 				if hasGlossMetal(norm_tex, getattr(material, "cls", None)):
-					self.setParam("map_Pr", "textures/" + norm_tex + "_rough.png")
-					self.setParam("map_Pm", "textures/" + norm_tex + "_metal.png")
+					self.setParam("map_Pr", "textures/" + norm_tex + objRoughSuffix())
+					self.setParam("map_Pm", "textures/" + norm_tex + objMetalSuffix())
 		
 		def setParam(self, name, value):
 			if value == None:
@@ -1644,7 +2009,12 @@ class MaterialTemplateLibrary(Terminable):
 				normName = str(mat.material.normal).split("*")[0]
 				if normName.lower().endswith(".dds"):
 					normName = normName[:-4]
-				decodeNormalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+				if OBJ_SRGB_PREENCODE:
+					decodeNormalForObjSrgb(path.join(outpath, "textures", f"{normName}.dds"))
+				elif OBJ_NORMAL_GLTF_PNG:
+					decodeNormalForGltf(path.join(outpath, "textures", f"{normName}.dds"))
+				else:
+					decodeNormalForObj(path.join(outpath, "textures", f"{normName}.dds"))
 
 				if hasGlossMetal(normName, getattr(mat.material, "cls", None)):
 					decodeGlossMetalForObj(path.join(outpath, "textures", f"{normName}.dds"))

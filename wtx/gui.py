@@ -1073,6 +1073,8 @@ class MainWindow(QMainWindow):
       return
     veh: Vehicle = sel[0].data(0, Qt.ItemDataRole.UserRole)
     self.current = veh
+    if self.library:
+      self.library.vehicle_blk = veh.path     # its default_skin says which camo the exports use
     self.lbl_name.setText(veh.name)
     self.lbl_id.setText(f"({veh.id})")
     self.lbl_nation.setText(veh.nation)

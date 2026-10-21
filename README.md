@@ -121,8 +121,8 @@ On first use, open **Settings**, check the game folder and press **Reload game d
    cd wt-asset-explorer
    ```
 2. **Download the latest binaries** and place them next to `main.py`:
-   * `wt_ext_cli.exe`: https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/latest
-   * `texconv.exe`: https://github.com/microsoft/DirectXTex/releases/latest
+   * `wt_ext_cli.exe`: https://github.com/Warthunder-Open-Source-Foundation/wt_ext_cli/releases/download/v0.6.6/wt_ext_cli-x86_64-pc-windows-msvc.zip
+   * `texconv.exe`: https://github.com/microsoft/DirectXTex/releases/download/may2026/texconv.exe
 3. **Create and activate a virtual environment**
    ```bash
    python -m venv .venv

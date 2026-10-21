@@ -614,6 +614,15 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 
 				parser = self.getParser(format, vStride)
 
+				self.__autoRaw = None
+
+				if format == 17 and vStride == 32:
+					# Skinned meshes of this layout (the nets of the M1128 and similar): where the position and the UV sit inside the 32 bytes
+					# is not known for certain. Decode with the table's layout now (so nothing is lost if the check fails) and let
+					# __autoLayout__ compare the candidates against the mesh's own triangles once the faces are decoded.
+					self.__autoRaw = file.read(vCnt * vStride)
+					file.seek(0, 0)
+
 				if parser is None:
 					raise Exception(f"Unimplemented storage format {format}-{vStride}")
 				else:
@@ -674,6 +683,231 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			log.subLevel()
 
 			self.__faces = faces
+
+			if self.__autoRaw is not None:
+				try:
+					self.__autoLayout__()
+				except Exception as e:    # never lose the mesh over this check
+					log.log(f"Vertex layout check skipped ({type(e).__name__}: {e}); using the table's layout", LOG_WARN)
+
+			self.__autoRaw = None
+
+		# Picks where the position and the UV sit in a 32-byte skinned vertex. Every candidate field (3 x int16, 3 x half float,
+		# 3 x float at each possible byte) is scored by "mean triangle edge / size of the mesh": a correct position makes the triangles
+		# short against the whole mesh, a wrong field (bone weights, packed normals ...) makes some edges span it. The lowest score wins;
+		# the table's layout is kept only when it is about as good as the best (a coherent mesh scores around 0.01-0.03).
+		def __autoLayout__(self):
+			import numpy as np
+
+			vCnt = self.__gvData.getVertexCnt()
+			vStride = self.__gvData.getVertexStride()
+			raw = self.__autoRaw
+
+			if not raw or len(raw) < vCnt * vStride or not self.__faces:
+				return
+
+			bytesArr = np.frombuffer(raw, dtype=np.uint8, count=vCnt * vStride).reshape(vCnt, vStride)
+			tris = np.asarray(self.__faces, dtype=np.int64).reshape(-1, 3)
+			tris = tris[(tris >= 0).all(axis=1) & (tris < vCnt).all(axis=1)]
+
+			if len(tris) == 0:
+				return
+
+			if len(tris) > 60000:
+				tris = tris[:: -(-len(tris) // 60000)]
+
+			def field(kind, byte, n):
+				"""(vCnt, n) float32 read at `byte` as int16 / half float / float, or None when it is not a sane number field"""
+				dt = {"i2": "<i2", "f2": "<f2", "f4": "<f4"}[kind]
+				size = np.dtype(dt).itemsize
+
+				if byte + size * n > vStride:
+					return None
+
+				F = np.ascontiguousarray(bytesArr[:, byte:byte + size * n]).view(dt).reshape(vCnt, n).astype(np.float32)
+
+				if kind != "i2" and (not np.isfinite(F).all() or np.abs(F).max() > 1e4):
+					return None
+
+				return F
+
+			def ratio(P, minSpan):
+				span = P.max(axis=0) - P.min(axis=0)
+
+				if (span < minSpan).any():
+					return None
+
+				edges = np.concatenate([np.linalg.norm(P[tris[:, a]] - P[tris[:, b]], axis=1) for a, b in ((0, 1), (1, 2), (2, 0))])
+				diag = float(np.linalg.norm(span))
+
+				return float(edges.mean() / diag) if diag > 0 else None
+
+			candidates = []   # (ratio, kind, byte)
+			for kind, step in (("i2", 2), ("f2", 2), ("f4", 4)):
+				for byte in range(0, vStride, step):
+					P = field(kind, byte, 3)
+
+					if P is None:
+						continue
+
+					r = ratio(P, 1500 if kind == "i2" else 0.05)
+
+					if r is not None:
+						candidates.append((r, kind, byte))
+
+			if not candidates:
+				log.log("Vertex layout 17/32: no usable position field found; keeping the table's layout", LOG_WARN)
+				return
+
+			candidates.sort()
+
+			# Some smooth 3-vectors in the vertex are NOT positions: bone weights (4 values adding up to 1) and normals (length 1)
+			# vary gently over a net and so score better than the real position. Find those fields and rule them out.
+			weightBlocks = []   # (first byte, end byte, what)
+			for kind, size in (("i2", 2), ("f2", 2), ("f4", 4), ("u1", 1)):
+				for byte in range(0, vStride - size * 4 + 1, 1 if kind == "u1" else 2):
+					dt = {"i2": "<i2", "f2": "<f2", "f4": "<f4", "u1": "u1"}[kind]
+					W = np.ascontiguousarray(bytesArr[:, byte:byte + size * 4]).view(dt).reshape(vCnt, 4).astype(np.float64)
+
+					if not np.isfinite(W).all() or W.min() < 0:
+						continue
+
+					total = W.sum(axis=1) / {"i2": 32767.0, "f2": 1.0, "f4": 1.0, "u1": 255.0}[kind]
+
+					if (np.abs(total - 1) < 0.03).mean() > 0.97 and W.max() > 0:
+						weightBlocks.append((byte, byte + size * 4, f"bone weights {kind}x4 at bytes {byte}-{byte + size * 4 - 1}"))
+
+			def whyNot(c):
+				_r, kind, byte = c
+				size = 4 if kind == "f4" else 2
+				for a, b, what in weightBlocks:
+					if byte < b and byte + size * 3 > a:
+						return what
+
+				P = field(kind, byte, 3)
+				L = np.linalg.norm(P / 32767.0 if kind == "i2" else P, axis=1)
+
+				if np.abs(L - 1).mean() < 0.03:
+					return "unit-length vectors (normals)"
+
+				return None
+
+			ruledOut = [(c, whyNot(c)) for c in candidates]
+			kept = [c for c, why in ruledOut if why is None]
+
+			if kept:
+				skipped = [(c, why) for c, why in ruledOut if why is not None][:4]
+				if skipped:
+					log.log("Vertex layout 17/32: ruled out " + ", ".join(f"{c[1]}@{c[2]} ({why})" for c, why in skipped))
+				candidates = kept
+			else:
+				log.log("Vertex layout 17/32: every candidate looked like weights or normals; using the raw ranking", LOG_WARN)
+
+			best = candidates[0]
+			cur = next((c for c in candidates if c[1] == "i2" and c[2] == 8), None)
+
+			# The 28-byte skinned vertex (storage format 16, which decodes correctly) keeps its position at byte 12; the 32-byte one
+			# has 4 more bytes up front, which puts the position at byte 16. When that field is among the plausible ones, prefer it.
+			family = next((c for c in candidates if c[1] == "i2" and c[2] == vStride - 16), None)
+
+			log.log("Vertex layout 17/32: best position candidates (edge ratio, format, byte): "
+					+ ", ".join(f"{c[0]:.3f} {c[1]}@{c[2]}" for c in candidates[:6])
+					+ f"; table layout (i2@8): {'n/a' if cur is None else f'{cur[0]:.3f}'}")
+
+			if family is not None and family[0] < 0.05 and family[0] <= best[0] * 2.5:
+				chosen = family
+				P = field(chosen[1], chosen[2], 3)
+				P = P / 32768.0
+				self.__verts = [list(map(float, p)) for p in P]
+				log.log(f"Vertex layout 17/32: position at i2@{chosen[2]} (edge ratio {chosen[0]:.3f}, same place as the 28-byte layout plus 4); "
+						f"value range x {P[:, 0].min():.3f}..{P[:, 0].max():.3f}, y {P[:, 1].min():.3f}..{P[:, 1].max():.3f}, z {P[:, 2].min():.3f}..{P[:, 2].max():.3f}")
+			elif cur is not None and cur[0] <= best[0] * 1.5:
+				chosen = cur
+				log.log("Vertex layout 17/32: the table's position is as coherent as the best candidate; kept")
+			else:
+				chosen = best
+				P = field(chosen[1], chosen[2], 3)
+				if chosen[1] == "i2":
+					P = P / 32768.0
+				self.__verts = [list(map(float, p)) for p in P]
+				log.log(f"Vertex layout 17/32: position moved to {chosen[1]}@{chosen[2]} (edge ratio {chosen[0]:.3f})")
+
+			# UV: the table has none for this layout. A plausible texture-coordinate range, smooth over the triangles, clear of the position.
+			posBytes = range(chosen[2], chosen[2] + (12 if chosen[1] == "f4" else 6))
+			bestUV = None
+			uvCandidates = {}
+			for byte in range(0, vStride - 3, 2):
+				if byte in posBytes or byte + 1 in posBytes or byte + 2 in posBytes or byte + 3 in posBytes:
+					continue
+
+				if any(byte < b and byte + 4 > a for a, b, _what in weightBlocks):    # bone weights are smooth too, they are not UVs
+					continue
+
+				UV = field("i2", byte, 2)
+
+				if UV is None or UV.min() < -16384 or UV.max() > 65536:
+					continue
+
+				r = ratio(UV, 400)
+
+				if UV.max() >= 32767 or UV.min() <= -32768:    # clamped values (normals / tangents), not texture coordinates
+					continue
+
+				if r is not None and r <= 0.12:
+					uvCandidates[byte] = r
+
+					if bestUV is None or r < bestUV[0]:
+						bestUV = (r, byte)
+
+			# Diagnostics only: every UV-like field found, with its raw range, and the raw bytes of the first vertices, so the real UV
+			# field can be picked by comparing against the game's own UV layout.
+			try:
+				for _b in sorted(uvCandidates, key=uvCandidates.get)[:8]:
+					_f = field("i2", _b, 2)
+					log.log(f"Vertex layout 17/32: UV candidate byte {_b}: edge ratio {uvCandidates[_b]:.3f}, raw u {int(_f[:, 0].min())}..{int(_f[:, 0].max())}"
+							f" v {int(_f[:, 1].min())}..{int(_f[:, 1].max())}")
+				for _i in (0, vCnt // 2, vCnt - 1):
+					log.log(f"Vertex layout 17/32: raw vertex {_i}: " + bytesArr[_i].tobytes().hex(" ", 2))
+			except Exception as e:
+				log.log(f"Vertex layout 17/32: candidate dump failed ({e})", LOG_WARN)
+
+			# the other skinned layouts end with the UV (28-byte format at byte 24): prefer the last four bytes when they qualify
+			lastUV = uvCandidates.get(vStride - 4)
+			lastField = field("i2", vStride - 4, 2)
+			# a field spanning 0..4096 on both axes is a UV set in the game's 12-bit atlas range: take it whatever its smoothness score
+			atlas = lastField is not None and lastField.min() >= -64 and lastField.max() <= 4200 and (lastField.max(axis=0) - lastField.min(axis=0) >= 1000).all()
+
+			if lastUV is not None and (atlas or (bestUV is not None and lastUV <= bestUV[0] * 2.5)):
+				bestUV = (lastUV, vStride - 4)
+
+			if bestUV is None:
+				log.log("Vertex layout 17/32: no texture coordinates found; UVs stay empty", LOG_WARN)
+				return
+
+			r, byte = bestUV
+			log.log(f"Vertex layout 17/32: UV at byte {byte} (edge ratio {r:.3f})")
+			UV = field("i2", byte, 2)
+			self.__UVs = [(float(u) / 4096, 1 - float(v) / 4096) for u, v in UV]
+
+			# Diagnostics only (changes nothing): how the picture is laid on the surface. Per triangle, the 3D size of one UV unit along
+			# its two stretch directions; a big gap between them (aniso) means stretched UVs, a different median means a different scale.
+			try:
+				P3 = np.asarray(self.__verts, dtype=np.float64).reshape(-1, 3)
+				T2 = np.asarray(self.__UVs, dtype=np.float64).reshape(-1, 2)
+				e1, e2 = P3[tris[:, 1]] - P3[tris[:, 0]], P3[tris[:, 2]] - P3[tris[:, 0]]
+				u1, u2 = T2[tris[:, 1]] - T2[tris[:, 0]], T2[tris[:, 2]] - T2[tris[:, 0]]
+				G3 = np.stack([np.stack([(e1 * e1).sum(1), (e1 * e2).sum(1)], 1), np.stack([(e1 * e2).sum(1), (e2 * e2).sum(1)], 1)], 1)
+				Gu = np.stack([np.stack([(u1 * u1).sum(1), (u1 * u2).sum(1)], 1), np.stack([(u1 * u2).sum(1), (u2 * u2).sum(1)], 1)], 1)
+				ok = np.abs(np.linalg.det(Gu)) > 1e-12
+				ev = np.linalg.eigvals(np.linalg.solve(Gu[ok], G3[ok])).real
+				ev = np.sqrt(np.clip(ev, 1e-18, None))
+				smax, smin = ev.max(axis=1), ev.min(axis=1)
+				log.log(f"Vertex layout 17/32: UV raw range u {int(UV[:, 0].min())}..{int(UV[:, 0].max())} v {int(UV[:, 1].min())}..{int(UV[:, 1].max())}"
+						f" -> u {T2[:, 0].min():.3f}..{T2[:, 0].max():.3f} v {T2[:, 1].min():.3f}..{T2[:, 1].max():.3f}")
+				log.log(f"Vertex layout 17/32: surface size of one UV unit: median {np.median(smax):.2f} / {np.median(smin):.2f} (units per UV 1.0), "
+						f"aniso median {np.median(smax / smin):.2f}, 90th percentile {np.percentile(smax / smin, 90):.2f}")
+			except Exception as e:
+				log.log(f"Vertex layout 17/32: UV diagnostics failed ({e})", LOG_WARN)
 
 		def getVertices(self):
 			return self.__verts

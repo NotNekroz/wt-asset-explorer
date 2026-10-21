@@ -3,6 +3,8 @@ from __future__ import annotations
 """glTF 2.0 / GLB converter for War Thunder models."""
 
 import os
+import math
+import time as _time
 import numpy as np
 from itertools import chain
 from pathlib import Path
@@ -25,7 +27,7 @@ def _say(msg: str) -> None:
 # Use EXACTLY the same diffuse/camo pairing + bake as the OBJ/MTL exporter so both outputs match.
 # material.py lives in the 'parse' package (parse.material); a bare `import material` only works if the parse
 # folder itself is on sys.path, which it is not in the app. That silent ImportError is what skipped the bake.
-getCamoPair = bakeCamoPairs = readDdsRgba = skinOverride = glossMetalMaps = None
+getCamoPair = bakeCamoPairs = readDdsRgba = skinOverride = glossMetalMaps = setNetPaintedMasks = None
 _material_import_error = None
 for _modname in ("parse.material", "material"):
     try:
@@ -36,6 +38,7 @@ for _modname in ("parse.material", "material"):
         readDdsRgba = _mod.readDdsRgba
         skinOverride = getattr(_mod, "skinOverride", None)
         glossMetalMaps = getattr(_mod, "glossMetalMaps", None)
+        setNetPaintedMasks = getattr(_mod, "setNetPaintedMasks", None)
         _material_import_error = None
         break
     except Exception as _e:  # keep the LAST error so it can be reported
@@ -210,6 +213,53 @@ def _diffuse_camo(mat):
     return diffuse, camo
 
 
+NET_ALPHA_CUTOFF = 0.25      # camouflage nets (class *_net_*): see the alpha block in the materials loop
+
+def _diag(msg):
+    """Diagnostic line: collected and printed together at the end of the export log (falls back to the normal log)."""
+    lines = getattr(_mod, "DIAG_LINES", None) if "_mod" in globals() else None
+    if lines is not None:
+        lines.append(str(msg))
+    else:
+        _say(msg)
+
+
+NET_MASK_RES = 2048          # resolution of the UV-space masks (the bake resizes them to the texture's size)
+
+_ALPHA_SEEN = {}     # (path, mtime) -> statistics text: a 4096x2048 texture used by three materials is decoded once
+
+
+def _alpha_report(file_path, mat_name):
+    """Diagnostics only: the file format and alpha statistics of an alpha-tested material's colour texture."""
+    try:
+        _key = (str(file_path), os.path.getmtime(file_path))
+        if _key in _ALPHA_SEEN:
+            print(f"[alpha] {mat_name}: {_ALPHA_SEEN[_key]}")
+            return
+        with open(file_path, "rb") as f:
+            head = f.read(148)
+        info = head[84:88].decode("latin1").replace("\x00", "") or "uncompressed"
+        if head[84:88] == b"DX10":
+            info += f" dxgi={int.from_bytes(head[128:132], 'little')}"
+        import numpy as _np
+        # Fast reader first: Pillow takes 30+ s on a 4096x4096 DDS, and this is a diagnostic line only.
+        _arr = readDdsRgba(str(file_path)) if readDdsRgba is not None else None
+        if _arr is not None:
+            a = _arr[..., 3]
+            _size, _mode = (_arr.shape[1], _arr.shape[0]), "RGBA"
+        else:
+            from PIL import Image as _PILImage
+            im = _PILImage.open(file_path)
+            a = _np.asarray(im.convert("RGBA"))[..., 3]
+            _size, _mode = im.size, im.mode
+        _text = (f"colour {os.path.basename(str(file_path))} ({info}, {_size[0]}x{_size[1]}, mode {_mode}): "
+                 f"alpha min {int(a.min())} mean {a.mean():.0f} max {int(a.max())}, {100 * float((a < 128).mean()):.1f}% of pixels below 128")
+        _ALPHA_SEEN[_key] = _text
+        print(f"[alpha] {mat_name}: {_text}")
+    except Exception as e:
+        print(f"[alpha] {mat_name}: could not read alpha of {file_path} ({type(e).__name__}: {e})")
+
+
 # Glass (dynamic_glass_chrome). The game colours it with a view-angle lookup strip (<x>_rainbow_coating, slot t3) that glTF
 # cannot express, and building a texture for it is not worth the risk, so the strip is ignored and every glass material
 # gets the same plain, shiny, see-through look:
@@ -362,12 +412,17 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
     mat_index_map = {}        # exact material name -> glTF material index
     mat_index_map_ci = {}     # lowercase fallback
     model_mat_to_gltf = {}    # index in mdl.materials -> glTF material index (names are not unique)
+    _t_bake = _time.perf_counter()
     if export_textures and (bakeCamoPairs is None or getCamoPair is None):
         _say(f"[WARNING] glTF: camo bake unavailable (could not import material.py -> {_material_import_error}); "
              "the GLB will use the raw, unpainted diffuse")
     elif export_textures:
         # The glTF path never goes through MaterialTemplateLibrary.exportTextures, so the camo bake has to
         # happen here. Same pairs, same function, same result as the OBJ's map_Kd texture.
+        try:
+            setNetPaintedMasks({})     # the masks are built after the meshes are read (section 3) and the nets re-baked then
+        except Exception:
+            pass
         pairs = {}
         for mat in (getattr(mdl, "materials", None) or []):
             try:
@@ -387,6 +442,7 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
             except Exception as e:
                 _say(f"[WARNING] glTF: camo bake failed: {type(e).__name__}: {e}")
 
+    _t_mats = _time.perf_counter()
     tex_index = index_texture_dir(tex_dir) if export_textures else {}
     image_cache = {}          # file name -> glTF texture index (one Image/Texture per file)
 
@@ -411,7 +467,10 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
             ))
         return default_mat_idx
 
+    net_mat_by_name = {}       # the same by glTF material name (the model can hold several materials with one name)
+    net_mat_pair = {}          # glTF material index -> (diffuse, camo) of a net-class material with a camo
     for idx, mat in enumerate(getattr(mdl, "materials", None) or []):
+        diffuse_for_net = None
         mat_name = mat.getName() if hasattr(mat, "getName") else f"mat_{idx}"
         pbr = PbrMetallicRoughness(baseColorFactor=[1.0, 1.0, 1.0, 1.0], metallicFactor=0.0, roughnessFactor=0.9)
         gltf_mat = Material(name=mat_name, pbrMetallicRoughness=pbr)
@@ -419,6 +478,7 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
         if tex_index:
             slots = _slot_list(mat)
             diffuse, camo = _diffuse_camo(mat)
+            diffuse_for_net = (diffuse, camo) if diffuse and camo else None
 
             # Base colour: the baked <diffuse>__<camo> file first (exactly what the OBJ's map_Kd uses),
             # then the plain diffuse with its suffix variants.
@@ -475,6 +535,20 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
         if "atest" in cls_name:
             gltf_mat.alphaMode = "MASK"
             gltf_mat.alphaCutoff = 127.0 / 255.0
+            # The material can set its own alpha-test reference ("atest", 0..255). Use it instead of the fixed 0.5, so soft
+            # weave pixels the game keeps (alpha above its reference) are not cut out here. Logged, so it can be checked.
+            try:
+                _ref = mat.getParams().get("atest")
+                if _ref is not None:
+                    _v = float(_ref)
+                    _v = _v / 255.0 if _v > 1.0 else _v
+                    gltf_mat.alphaCutoff = min(max(_v, 0.0), 1.0)
+            except Exception:
+                pass     # no readable atest parameter: the 127/255 cutoff set above stays
+            # A net is a fine weave of about half transparent pixels. The viewer averages them when the net is small on screen
+            # (mean alpha ~0.43), which falls under a 0.5 cut-off and removes the whole net. A lower cut-off keeps it visible.
+            if "_net_" in cls_name:
+                gltf_mat.alphaCutoff = NET_ALPHA_CUTOFF
         elif "glass" in cls_name or "alpha_blend" in cls_name:
             gltf_mat.alphaMode = "BLEND"
             if "glass" in cls_name:
@@ -484,12 +558,16 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
             gltf_mat.alphaMode = "OPAQUE"
         gltf_mat.doubleSided = True
 
+        if "_net_" in cls_name and diffuse_for_net:
+            net_mat_pair[len(gltf.materials)] = diffuse_for_net
+            net_mat_by_name.setdefault(mat_name, diffuse_for_net)
         mat_idx_val = len(gltf.materials)
         gltf.materials.append(gltf_mat)
         model_mat_to_gltf[idx] = mat_idx_val
         mat_index_map.setdefault(mat_name, mat_idx_val)
         mat_index_map_ci.setdefault(mat_name.lower(), mat_idx_val)
 
+    _t_mesh = _time.perf_counter()
     # =========================================================================
     # 3. MESH GEOMETRY
     # =========================================================================
@@ -507,6 +585,9 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
         except np.linalg.LinAlgError:
             return np.linalg.pinv(m)
 
+    net_nodes = set(getattr(_mod, "NET_NODES", set()) or []) if "_mod" in globals() else set()
+    net_layers = {}            # diffuse (lower) -> [net mask image, ordinary mask image]
+    net_report = {}            # diffuse (lower) -> {"net": [mesh], "ordinary": [mesh]}
     rebased_names = []
     for obj in mdl:
         faces = obj.faces
@@ -603,6 +684,30 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
             primitives.append(Primitive(attributes=Attributes(POSITION=pos_acc, TEXCOORD_0=uv_acc),
                                         indices=len(gltf.accessors) - 1, material=mat_id))
 
+        # UV triangles of every mesh that uses a net-class material, split into net meshes and ordinary parts. The net meshes are
+        # the nodes the vehicle's BLK lists in camouflage_net (without that block: skinned or *net* meshes).
+        if net_mat_pair and setNetPaintedMasks is not None:
+            from PIL import Image as _PImg, ImageDraw as _PDraw
+            _is_net = (obj.name.lower() in net_nodes) if net_nodes else (is_skinned or "net" in obj.name.lower())
+            for first, end, mat_id in runs:
+                _pair = net_mat_pair.get(mat_id) or net_mat_by_name.get(gltf.materials[mat_id].name)
+                if not _pair:
+                    continue
+                _key = str(_pair[0]).lower()
+                if _key not in net_layers:
+                    _ni, _oi = _PImg.new("L", (NET_MASK_RES, NET_MASK_RES), 0), _PImg.new("L", (NET_MASK_RES, NET_MASK_RES), 0)
+                    net_layers[_key] = (_ni, _oi, _PDraw.Draw(_ni), _PDraw.Draw(_oi))
+                    net_report[_key] = {"net": [], "ordinary": []}
+                _kind = "net" if _is_net else "ordinary"
+                if obj.name not in net_report[_key][_kind]:
+                    net_report[_key][_kind].append(obj.name)
+                _draw = net_layers[_key][2] if _is_net else net_layers[_key][3]
+                _tri = indices[3 * first:3 * end].reshape(-1, 3)
+                for _t in _tri:
+                    _pts = [(float(uvs[int(k)][0]), float(uvs[int(k)][1])) for k in _t]
+                    _ou, _ov = math.floor(min(p[0] for p in _pts) + 1e-6), math.floor(min(p[1] for p in _pts) + 1e-6)
+                    _draw.polygon([((p[0] - _ou) * (NET_MASK_RES - 1), (p[1] - _ov) * (NET_MASK_RES - 1)) for p in _pts], fill=255, outline=255)
+
         mesh_idx = len(gltf.meshes)
         gltf.meshes.append(Mesh(name=obj.name, primitives=primitives))
 
@@ -624,6 +729,24 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
                 root_nodes.append(node_idx)
         node_map.setdefault(obj.name, node_idx)
 
+    if net_layers and export_textures and bakeCamoPairs is not None:
+        _masks, _repairs = {}, {}
+        for _key, (_ni, _oi, _a, _b) in net_layers.items():
+            _net = np.asarray(_ni) > 0
+            _ord = (np.asarray(_oi) > 0) & ~_net
+            if _ord.any():
+                _masks[_key] = _ord
+        if _masks:
+            for _p in net_mat_pair.values():
+                if str(_p[0]).lower() in _masks:
+                    _repairs[bakedDiffuseName(*_p)] = _p
+            try:
+                setNetPaintedMasks(_masks)
+                bakeCamoPairs(str(tex_dir), _repairs)
+            except Exception as e:
+                _say(f"[WARNING] glTF: net re-bake with the ordinary-part mask failed: {type(e).__name__}: {e}")
+            finally:
+                setNetPaintedMasks({})
     _say(f"glTF: {len(rebased_names)} model-space mesh(es) re-based under their node: "
          + ", ".join(rebased_names[:40]) + (" ..." if len(rebased_names) > 40 else ""))
 

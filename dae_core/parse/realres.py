@@ -16,7 +16,7 @@ from struct import unpack, pack
 from parse.datablock import *
 from util.terminable import Packed, SafeRange, SafeIter, SafeEnumerate, Terminable
 from parse.mesh import MatVData, InstShaderMeshResource, ShaderMesh
-from parse.material import MaterialData, MaterialTemplateLibrary,  computeMaterialNames, TexturePathDict
+from parse.material import MaterialData, MaterialTemplateLibrary,  computeMaterialNames, TexturePathDict, swapVehicleTex, buildNetPaintedMasks, setNetPaintedMasks, writeBlenderShading
 from abc import abstractmethod, ABC
 from math import sqrt
 
@@ -1108,8 +1108,22 @@ class Model(Terminable):
 			if exportTexture:
 				# First run model-level texture extraction to catch all t0/t1/t2/camo slots
 				self.exportTextures(output, exportTexture=True, forceConvert=forceConvert)
+				# Net / cloth atlas: the texels only ordinary parts use are painted like any other camo (same pass the GLB export does)
+				try:
+					setNetPaintedMasks(buildNetPaintedMasks(self))
+				except Exception as e:    # never lose the export over this; the net atlas is then baked as net everywhere
+					setNetPaintedMasks({})
+					log.log(f"Net camo masks skipped ({type(e).__name__}: {e})", LOG_WARN)
+
 				# Then trigger mtl export routines (like baking/conversions)
-				mtl.exportTextures(output, forceConvert)
+				try:
+					mtl.exportTextures(output, forceConvert)
+				finally:
+					setNetPaintedMasks({})
+
+				# REMOVED (user: no longer used): the <name>_blender_shading.py helper written here next to the .obj.
+				# It called material.writeBlenderShading(output + "/" + self.exportName + "_blender_shading.py", self.materials)
+				# inside try/except (a failure only logged a warning). The function and BLENDER_SHADING_SCRIPT stay in material.py, unused.
 
 			log.subLevel()
 
@@ -1177,7 +1191,7 @@ class Model(Terminable):
 				all_texs = list(mat.textures)
 				params = mat.getParams()
 				for key in ("t0", "t1", "t2", "camo_tex"):
-					val = params.get(key)
+					val = swapVehicleTex(params.get(key))
 					if isinstance(val, str) and val and val not in all_texs:
 						all_texs.append(val)
 
@@ -1195,10 +1209,14 @@ class Model(Terminable):
 						else:
 							texN = None
 
-						if (texN or tex) in exported:
+						# Same output file whether it is asked for as 'name' (pass 0) or 'name*' (pass 1) unless a modified variant ('namem') exists,
+						# so key on the file name; before, pass 1 never matched pass 0 and every texture was converted and written twice.
+						key = texN or MaterialData.getTexFileName(tex)
+
+						if key in exported:
 							continue
 
-						exported.add(texN or tex)
+						exported.add(key)
 
 						self.setSubTask(mat)
 						mat.exportTexture(

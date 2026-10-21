@@ -110,7 +110,9 @@ class AssetLibrary:
         self._descs_loaded: set[str] = set()
         self.overrides: dict[str, dict] = {}
         self._overrides_path = self.cache_dir / "overrides.json"
+        self._pack_batch = None                            # set of texture packs already in memory while a weapon batch runs (None = no batch)
         self.last_node_world: dict = {}                    # skeleton world matrices of the model export_obj built last
+        self.vehicle_blk: Path | None = None               # BLK of the vehicle selected in the GUI: its default_skin says which camo it wears
         self._load_overrides()
 
     # ------------------------------------------------------------------ helpers
@@ -590,6 +592,7 @@ class AssetLibrary:
                     node = names_root
                 place(levels, depth + 1, node, f"{label}/{i + 1}")
 
+        self._pack_batch = set()                      # texture packs are read once for the whole loadout
         try:
             for slot, preset, m in mounts:
                 parent = merger.find_node(m.emitter)
@@ -600,6 +603,8 @@ class AssetLibrary:
             if merger.added:
                 merger.save()
         finally:
+            self._pack_batch = None
+            AssetCacher.clearCache(DDSx)          # unload the textures once, after the last weapon
             shutil.rmtree(tmp_root, ignore_errors=True)
         status(f"  [weapons] {placed} weapon model(s) placed for {len(mounts)} mount(s)")
         for msg in dict.fromkeys(problems):
@@ -676,6 +681,7 @@ class AssetLibrary:
                     local = np.eye(4)
                 place(levels, depth + 1, G @ local, f"{label}/{i + 1}")
 
+        self._pack_batch = set()                      # texture packs are read once for the whole loadout
         try:
             for slot, preset, m in mounts:
                 E = vehicle_world.get(m.emitter.lower())
@@ -686,6 +692,8 @@ class AssetLibrary:
             if merger.added:
                 merger.save()
         finally:
+            self._pack_batch = None
+            AssetCacher.clearCache(DDSx)          # unload the textures once, after the last weapon
             shutil.rmtree(tmp_root, ignore_errors=True)
         status(f"  [weapons] {placed} weapon model(s) placed for {len(mounts)} mount(s)")
         for msg in dict.fromkeys(problems):
@@ -771,6 +779,14 @@ class AssetLibrary:
                     packs[d] = None
             else:
                 missing += 1
+        batch = self._pack_batch
+        if batch is not None:
+            # weapon batch: the packs stay in memory from one weapon to the next (they are cleared once, when the batch ends)
+            if set(packs) <= batch:
+                status(f"Model uses {len(wanted)} textures -> {len(packs)} texture pack(s) already loaded"
+                       + (f" ({missing} not found in any pack)" if missing else ""))
+                return
+            packs = {k: None for k in (batch | set(packs))}     # reload the union so HQ packs still load last
         status(f"Model uses {len(wanted)} textures -> loading {len(packs)} texture pack(s)"
                + (f" ({missing} not found in any pack)" if missing else ""))
         AssetCacher.clearCache(DDSx)
@@ -787,6 +803,8 @@ class AssetLibrary:
             finally:
                 log.setMuted(False)
             status(f"  texture pack {rel.rsplit('/', 1)[-1]}")
+            if batch is not None:
+                batch.add(rel)
 
     @staticmethod
     def _prune_unused_textures(model_file, out_dir, status: Status) -> None:
@@ -936,8 +954,44 @@ class AssetLibrary:
             arr[..., 3] = 0
         Image.fromarray(np.ascontiguousarray(arr), "RGBA").save(str(dst), format="TGA")
 
+    def _skin_details(self, mat, tex: str, skin_dir: Path, work: Path) -> int:
+        """Details layers (panel lines, rivets) of one texture of the skin template, written into <skin folder>/Details (wtx/skin_details.py).
+        _n: the normal map as a detail layer. _c: a cavity map computed from the material's _n, and the fine detail of the colour texture.
+        Returns the number of files written. These files are rebuilt on every export (they are layers to paste, not files to edit)."""
+        from wtx import skin_details as sd
+        low = tex.lower()
+        if not low.endswith(("_n", "_c")):
+            return 0
+
+        def load(name):
+            dds = work / "textures" / f"{name}.dds"
+            if not dds.exists():
+                mat.exportTexture(name, str(work), True)
+            return _loadDdsArray(str(dds), str(work)) if dds.exists() else None
+
+        out_dir = Path(skin_dir) / sd.DETAILS_DIR
+        if low.endswith("_n"):
+            arr = load(tex)
+            return sd.write_normal_details(out_dir, tex, arr) if arr is not None else 0
+        rgb = load(tex)
+        if rgb is None:
+            return 0
+        normal = getattr(mat, "normal", None)
+        normal_arr = None
+        if normal:
+            n_name = str(normal).split("*")[0]
+            n_name = n_name[:-4] if n_name.lower().endswith(".dds") else n_name
+            normal_arr = load(n_name)
+        return sd.write_colour_details(out_dir, tex, rgb, normal_arr)
+
     def export_skin_template(self, ref: AssetRef, skin_dir: Path, vehicle_id: str, status: Status,
                              weapon_levels=(), lod: int = 0, vehicle_name: str = "") -> tuple[Path, int]:
+        """Same as _export_skin_template_impl, with the camo the vehicle's BLK swaps in (see _vehicle_camo)."""
+        with self._vehicle_camo(status, fixed_skin=False):   # a template keeps the game's own textures
+            return self._export_skin_template_impl(ref, skin_dir, vehicle_id, status, weapon_levels=weapon_levels, lod=lod, vehicle_name=vehicle_name)
+
+    def _export_skin_template_impl(self, ref: AssetRef, skin_dir: Path, vehicle_id: str, status: Status,
+                                   weapon_levels=(), lod: int = 0, vehicle_name: str = "") -> tuple[Path, int]:
         """Write a custom-skin folder for a vehicle: every albedo (_c) and normal (_n) texture its model (and the
         weapon models of the chosen loadout) uses, as .tga files with the game's own names (tanks and ships get their camo baked in, like the OBJ / GLB export), plus <vehicle id>.blk
         that maps each game texture to its file. Edit the files, copy the folder into War Thunder/UserSkins.
@@ -950,6 +1004,7 @@ class AssetLibrary:
         import shutil
         import tempfile
         from wtx import uv_guide
+        from wtx import skin_details
         from wtx.skin_blk import SKIN_EXT, skin_textures, write_blk
         from wtx.skin_docs import instructions_text
         from parse.material import bakeCamoPairs, getCamoPair
@@ -972,6 +1027,15 @@ class AssetLibrary:
 
         names: list[str] = []
         done_refs = set()
+        details_written = 0
+        _det = Path(skin_dir) / skin_details.DETAILS_DIR
+        if _det.is_dir():                                  # layers are rebuilt every time: drop files of older versions (e.g. *_detail_cavity.png)
+            for _old in _det.iterdir():
+                if _old.is_file():
+                    try:
+                        _old.unlink()
+                    except OSError:
+                        pass
         work = Path(tempfile.mkdtemp(prefix="wt_skin_"))
         try:
             for model_ref, label in jobs:
@@ -997,7 +1061,6 @@ class AssetLibrary:
                         if tex not in names:
                             names.append(tex)
                             wanted_here.append((mat, tex))
-                status(f"  [skin] {label}: {len(wanted_here)} new texture(s)")
                 for mat, tex in wanted_here:
                     target = skin_dir / f"{tex}{SKIN_EXT}"
                     if target.exists():
@@ -1024,6 +1087,13 @@ class AssetLibrary:
                         self._dds_to_tga(got, target, work, baked_rgb, clear_alpha=bool(camo))
                     except Exception as e:                # noqa: BLE001
                         status(f"  [skin] ! could not write {target.name}: {type(e).__name__}: {e}")
+
+                # Details layers (panel lines, rivets): one pass per model, a failure only loses these files.
+                for mat, tex in wanted_here:
+                    try:
+                        details_written += self._skin_details(mat, tex, skin_dir, work)
+                    except Exception as e:                # noqa: BLE001
+                        status(f"  [skin] ! details for {tex} failed: {type(e).__name__}: {e}")
 
                 # UV guides: need the built mesh, so a model too big for memory only loses these, never the textures.
                 tris_by_tex = {}
@@ -1056,8 +1126,6 @@ class AssetLibrary:
                         except Exception as e:            # noqa: BLE001
                             status(f"  [skin] ! UV guide for {tex} failed: {type(e).__name__}: {e}")
                 tris_by_tex = None
-                if wanted_here:
-                    status(f"  [skin] {label}: {guided} UV guide(s)")
                 AssetCacher.clearCache(DDSx)
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -1066,12 +1134,44 @@ class AssetLibrary:
         for n in names:
             if n not in present:
                 status(f"  [skin] ! {n} was not found in the game files - left out of the .blk")
+        if details_written:
+            status(f"  Details: {details_written} file(s) in {skin_details.DETAILS_DIR}/ (panel lines and rivets to paste over your skin)")
         blk, fresh = write_blk(skin_dir, vehicle_id, present)
         if not fresh:
             status(f"  [skin] {vehicle_id}.blk already exists and was kept; the new one is {blk.name}")
         shown = vehicle_name or vehicle_id
         (skin_dir / "INSTRUCTIONS.txt").write_text(instructions_text(shown, vehicle_id, SKIN_EXT), encoding="utf-8")
         return blk, len(present)
+
+    @contextlib.contextmanager
+    def _vehicle_camo(self, status: Status, fixed_skin: bool = True):
+        """For the duration of an export, the materials use the camo the selected vehicle's BLK swaps in (default_skin ->
+        replace_tex), not the placeholder camo their material lists. Nothing changes when there is no vehicle or no swap.
+        The [camo] / [net] lines of the export are printed together right before the end of the log."""
+        from parse import material as _material
+        from wtx.vehicle_camo import default_fixed_skin_swaps, default_camo_swaps, camouflage_net_nodes
+        _material.DIAG_LINES.clear()
+        diag = _material.DIAG_LINES
+        _nodes = camouflage_net_nodes(self.vehicle_blk)
+        _material.setNetNodes(_nodes)
+        swaps = default_camo_swaps(self.vehicle_blk)
+        # set_tex ... camo_skin_tex: a fixed skin picture the game lays over the body / turret / gun by its alpha (material.py).
+        _material.setFixedSkinOverlays(default_fixed_skin_swaps(self.vehicle_blk) if fixed_skin else {})
+        if swaps:
+            _material.setVehicleTexSwaps(swaps)
+        else:
+            _material.clearVehicleTexSwaps()
+        try:
+            yield
+        finally:
+            _material.setNetNodes(set())
+            _material.setFixedSkinOverlays({})
+            if swaps:
+                _material.clearVehicleTexSwaps()
+            if diag:
+                for _ln in diag:
+                    status(_ln)
+                diag.clear()
 
     @contextlib.contextmanager
     def _skin_textures(self, skin_dir, textures: bool, status: Status, gltf: bool = False):
@@ -1082,20 +1182,20 @@ class AssetLibrary:
             yield
             return
         from parse import material as _material
-        from wtx.skin_blk import read_skin_folder
-        skin = read_skin_folder(Path(skin_dir))
+        from wtx.skin_blk import read_skin_folder_report
+        skin, skin_notes = read_skin_folder_report(Path(skin_dir))
         if not skin:
             status(f"[skin] no textures found in {skin_dir}")
             yield
             return
+        for _n in skin_notes:
+            status(f"[skin] {_n}")
         _material.setSkinOverrides(skin, gltf=gltf)
-        status(f"[skin] {len(skin)} texture(s) in {Path(skin_dir).name}; the model uses them instead of the game's")
         try:
             yield
         finally:
             used = set(_material.SKIN_USED)
             _material.clearSkinOverrides()
-            status(f"[skin] used {len(used)} skin texture(s) on this model")
             unused = sorted(k for k in skin if k not in used)
             if unused:
                 status("[skin] not used by this model (not one of its textures): " + ", ".join(unused))
@@ -1104,7 +1204,7 @@ class AssetLibrary:
                    strip_fx: bool = True, hide_nodes=None, mounts=None, mirror_nodes=None,
                    prune_unused: bool = True, skin_dir=None) -> Path:
         """Same as _export_obj_impl; with skin_dir the custom skin's textures are used on the model (see _skin_textures)."""
-        with self._skin_textures(skin_dir, textures, status):
+        with self._vehicle_camo(status), self._skin_textures(skin_dir, textures, status):
             return self._export_obj_impl(ref, out_dir, status, textures=textures, lod=lod, strip_fx=strip_fx, hide_nodes=hide_nodes, mounts=mounts, mirror_nodes=mirror_nodes, prune_unused=prune_unused, skin_dir=skin_dir)
 
     def _export_obj_impl(self, ref: AssetRef, out_dir: Path, status: Status, textures: bool = True, lod: int = 0,
@@ -1215,7 +1315,8 @@ class AssetLibrary:
         out_dir.mkdir(parents=True, exist_ok=True)
         status(f"Writing OBJ to {out_dir} ...")
         mdl.exportObj(str(out_dir), textures, True)
-        AssetCacher.clearCache(DDSx)
+        if self._pack_batch is None:                   # inside a weapon batch the textures stay loaded until the batch ends
+            AssetCacher.clearCache(DDSx)
         obj_file = out_dir / f"{mdl.exportName}.obj"
         if strip_fx:                    # jet flames, gun fire, flares: game effects, useless (and ugly) in Blender
             try:
@@ -1249,7 +1350,7 @@ class AssetLibrary:
                     animations: bool = True, strip_fx: bool = True, hide_nodes=None, mounts=None,
                     mirror_nodes=None, prune_unused: bool = True, skin_dir=None) -> Path:
         """Same as _export_gltf_impl; with skin_dir the custom skin's textures are used on the model (see _skin_textures)."""
-        with self._skin_textures(skin_dir, textures, status, gltf=True):
+        with self._vehicle_camo(status), self._skin_textures(skin_dir, textures, status, gltf=True):
             return self._export_gltf_impl(ref, out_dir, status, textures=textures, lod=lod, animations=animations, strip_fx=strip_fx, hide_nodes=hide_nodes, mounts=mounts, mirror_nodes=mirror_nodes, prune_unused=prune_unused, skin_dir=skin_dir)
 
     def _export_gltf_impl(self, ref: AssetRef, out_dir: Path, status: Status, textures: bool = True, lod: int = 0,
@@ -1369,7 +1470,8 @@ class AssetLibrary:
             except Exception as e:      # never lose the exported model because of an animation problem
                 status(f"[WARNING] animations skipped: {type(e).__name__}: {e}")
 
-        AssetCacher.clearCache(DDSx)
+        if self._pack_batch is None:                   # inside a weapon batch the textures stay loaded until the batch ends
+            AssetCacher.clearCache(DDSx)
         if mounts:                      # after the animations: the added nodes must not be matched by their tracks
             try:
                 self.attach_mounts(Path(glb_file), mounts, out_dir, status, textures=textures)

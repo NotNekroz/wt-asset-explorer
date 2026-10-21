@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from wtx.uv_guide import GUIDE_DIR
+from wtx.skin_details import C_DETAIL_FORMAT, DETAILS_DIR
 
 
 def instructions_text(vehicle_name: str, vehicle_id: str, ext: str = ".tga") -> str:
@@ -16,6 +17,7 @@ WHAT IS IN THIS FOLDER
   *{ext}            the textures to paint. Their names must not change
   {GUIDE_DIR}/  one PNG per colour (_c) texture: the outline of each UV island, i.e. where each part of the model sits on the texture.
                      Use it as a layer on top while painting; do not save it into the texture
+  {DETAILS_DIR}/  the vehicle's panel lines, rivets and weld seams as separate layers, to paste over your own paint (see DETAILS below)
   INSTRUCTIONS.txt   this file
 
 HOW TO USE IT
@@ -25,6 +27,14 @@ HOW TO USE IT
      this folder, and you get an OBJ or GLB (the format chosen in the app) with your textures on it.
   3. Copy this whole folder into War Thunder/UserSkins, then pick it under "User skin" in the vehicle's
      customization screen.
+
+DETAILS ({DETAILS_DIR}/, rebuilt on every export; they are layers, not files the game reads)
+  <name>_c.{C_DETAIL_FORMAT}   grey layer with transparency: only the panel lines and details (grooves dark, rivet edges light), flat areas have no data;
+                 computed from the normal map of the same material, so it holds none of the game's paint.
+                 Open it in your editor and put it above your paint (Normal mode, or try Overlay / Soft Light); the background stays see-through.
+                 Same size and layout as the _c texture of the same name. Materials without a normal map get no file.
+  <name>_n.tga   the normal map in the game's layout (X in alpha, Y in green; red and blue are 0, they hold no gloss or metal).
+                 Paste only the alpha and green channels over your own normal map.
 
 THE .BLK
   - The very first line has to be exactly:   name:t="user"

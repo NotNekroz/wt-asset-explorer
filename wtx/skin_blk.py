@@ -90,19 +90,36 @@ _IMAGE_EXTS = (".tga", ".png", ".dds", ".jpg", ".jpeg", ".bmp")
 
 
 def read_skin_folder(folder) -> dict[str, Path]:
-    """The textures of a custom-skin folder: {game texture name (lower case): image file}.
+    """The textures of a custom-skin folder: {game texture name (lower case): image file}. See read_skin_folder_report."""
+    return read_skin_folder_report(folder)[0]
 
-    The .blk files of the folder say which game texture ('from') each file ('to') replaces; blocks are read whatever
-    their order and comments are skipped. Image files the .blk does not mention are taken by their own name, so a
-    folder without a .blk (or a half-finished one) still works for the preview. A 'to' that names a file that is not
-    there is left out."""
+
+def read_skin_folder_report(folder) -> tuple[dict[str, Path], list[str]]:
+    """({game texture name (lower case): image file}, notes for the log).
+
+    1. The .blk files of the folder say which game texture ('from') each file ('to') replaces, whatever the file names are
+       (leclerc_s2_body_c -> leclerc_s2_custom_body.tga). Blocks are read whatever their order, comments are skipped. The game
+       needs the 'to' name AND extension exactly, but the preview is lenient: when the folder has no file of that exact
+       name it takes the file with the same name and another image extension, and says so in the notes.
+    2. Image files no .blk block claimed are taken by their own name (the default name a generated .blk would use), so a
+       folder without a .blk, or a half-finished one, still works for the preview. A texture the .blk does not mention
+       and the folder has no default-named file for is simply not replaced.
+    A 'to' with no matching file at all is left out and reported."""
     import re
 
     folder = Path(folder)
+    notes: list[str] = []
     if not folder.is_dir():
-        return {}
+        return {}, notes
     files = {p.name.lower(): p for p in folder.iterdir() if p.is_file()}
+    by_stem: dict[str, list[Path]] = {}
+    for p in files.values():
+        if p.suffix.lower() in _IMAGE_EXTS:
+            by_stem.setdefault(p.stem.lower(), []).append(p)
+    for lst in by_stem.values():
+        lst.sort(key=lambda p: _IMAGE_EXTS.index(p.suffix.lower()))
     out: dict[str, Path] = {}
+    claimed: set[Path] = set()
     for blk in sorted(p for n, p in files.items() if n.endswith(".blk")):
         try:
             text = blk.read_text(encoding="utf-8", errors="replace")
@@ -115,10 +132,25 @@ def read_skin_folder(folder) -> dict[str, Path]:
             if not src or not dst:
                 continue
             name = clean(src.group(1)).lower()
-            target = files.get(dst.group(1).strip().replace("\\", "/").split("/")[-1].lower())
-            if name and target is not None and target.suffix.lower() in _IMAGE_EXTS:
-                out[name] = target
-    for fname, p in files.items():                     # images the .blk does not name
-        if p.suffix.lower() in _IMAGE_EXTS:
-            out.setdefault(p.stem.lower(), p)
-    return out
+            to_name = dst.group(1).strip().replace("\\", "/").split("/")[-1]
+            if not name or not to_name:
+                continue
+            target = files.get(to_name.lower())
+            if target is not None and target.suffix.lower() not in _IMAGE_EXTS:
+                target = None
+            if target is None:
+                near = by_stem.get(Path(to_name).stem.lower())
+                if near:
+                    target = near[0]
+                    notes.append(f"{blk.name}: '{name}' -> {to_name} is not in the folder, using {target.name} (the game needs the exact name)")
+            if target is None:
+                notes.append(f"{blk.name}: '{name}' -> {to_name}: no such file in the folder; the default name '{name}' is tried instead")
+                continue
+            out[name] = target
+            claimed.add(target)
+    for stem, lst in by_stem.items():                 # images no .blk block names: the default name
+        for p in lst:
+            if p not in claimed:
+                out.setdefault(stem, p)
+                break
+    return out, notes

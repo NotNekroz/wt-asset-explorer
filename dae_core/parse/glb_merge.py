@@ -131,6 +131,8 @@ class GlbMerger:
         mesh0 = len(js["meshes"])
         for me in cj.get("meshes", []):
             nme = copy.deepcopy(me)
+            if not nme.get("name") or nme["name"].startswith("@root"):
+                nme["name"] = name or path.stem          # Blender names an unnamed node after its mesh: '@root', '@root.001', ...
             for pr in nme.get("primitives", []):
                 pr["attributes"] = {k: v + acc0 for k, v in pr.get("attributes", {}).items()}
                 if "indices" in pr:
@@ -181,12 +183,17 @@ class GlbMerger:
         """Add the model under node `parent`. Returns {lower original node name: node index in the base file}."""
         nodes = self.js["nodes"]
         first = len(nodes)
+        unnamed = 0
         for n in model.nodes:
             nn = copy.deepcopy(n)
             if nn.get("children"):
                 nn["children"] = [c + first for c in nn["children"]]
             if nn.get("name"):
                 nn["name"] = f"{label}/{nn['name']}"       # prefixed: the vehicle's animation tracks match by name
+            elif "mesh" in nn:
+                # the weapon's mesh node has no name in its own file; without one every weapon imports as '@root'
+                unnamed += 1
+                nn["name"] = f"{label}/mesh" if unnamed == 1 else f"{label}/mesh_{unnamed}"
             nodes.append(nn)
         wrapper = len(nodes)
         nodes.append({"name": label, "children": [r + first for r in model.roots]})
