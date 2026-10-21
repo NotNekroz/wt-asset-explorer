@@ -624,6 +624,37 @@ def strip_empties(context, root, remove_all):
     return n, animated
 
 
+# ----------------------------------------------------------------------------- smooth shading
+def smooth_mesh_data(mesh):
+    """Same as right-click > Shade Smooth on one mesh."""
+    try:
+        mesh.shade_smooth()                  # Blender 4.1+
+    except AttributeError:
+        for p in mesh.polygons:              # older Blender
+            p.use_smooth = True
+        mesh.update()
+
+
+def smooth_objects(objs):
+    """Shade Smooth on the mesh of every MESH object in objs. A mesh shared by several objects is done once."""
+    seen, n = set(), 0
+    for o in objs:
+        if o.type != "MESH" or o.data is None:
+            continue
+        k = o.data.as_pointer()
+        if k in seen:
+            continue
+        seen.add(k)
+        smooth_mesh_data(o.data)
+        n += 1
+    log("smooth shading on %d meshes" % n)
+    return n
+
+
+def smooth_model(root):
+    return smooth_objects(model_objects(root))
+
+
 # ----------------------------------------------------------------------------- sliders
 STATE = {"root": None}
 CACHE = {}       # clip key -> list of (object, track name, strip name, frame start, frame end)
@@ -900,6 +931,8 @@ class WTAIR_OT_prepare(bpy.types.Operator):
             removed, _a = strip_empties(context, root, sc.wtair_strip_all)
         if sc.wtair_rename or sc.wtair_group:
             apply_names(context, root, sc.wtair_rename, sc.wtair_group)
+        if sc.wtair_smooth:
+            smooth_model(root)
         remember_vehicle(context, root)
         ok = setup_sliders(sc, root)
         self.report({"INFO"} if ok else {"WARNING"},
@@ -941,6 +974,22 @@ class WTAIR_OT_names(bpy.types.Operator):
             self.report({"INFO"}, "Named %d parts of the OBJ model" % n)
         else:
             apply_names(context, data, sc.wtair_rename, sc.wtair_group)
+        return {"FINISHED"}
+
+
+class WTAIR_OT_smooth(bpy.types.Operator):
+    bl_idname = "wtair.smooth"
+    bl_label = "Smooth shading"
+    bl_description = "Shade Smooth on every mesh of the model (like right-click > Shade Smooth). Ctrl+Z undoes it"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        kind, data, err = find_target(context)
+        if kind is None:
+            self.report({"ERROR"}, err)
+            return {"CANCELLED"}
+        n = smooth_objects(data["objs"] if kind == "obj" else model_objects(data))
+        self.report({"INFO"}, "Smooth shading on %d meshes" % n)
         return {"FINISHED"}
 
 
@@ -1055,16 +1104,19 @@ class WTAIR_PT_panel(bpy.types.Panel):
             col = lay.column(align=True)
             col.operator("wtair.names")
             col.operator("wtair.revert")
+            col.operator("wtair.smooth")
             return
         lay.prop(sc, "wtair_flat")
         row = lay.row()
         row.prop(sc, "wtair_strip")
         row.prop(sc, "wtair_strip_all")
+        lay.prop(sc, "wtair_smooth")
         lay.operator("wtair.prepare", icon="PLAY")
         col = lay.column(align=True)
         col.operator("wtair.strip")
         col.operator("wtair.names")
         col.operator("wtair.revert")
+        col.operator("wtair.smooth")
         col = lay.column(align=True)
         col.operator("wtair.sliders")
         col.operator("wtair.full")
@@ -1082,7 +1134,7 @@ class WTAIR_PT_panel(bpy.types.Panel):
                 lay.prop(it, "value", text=it.name, slider=True)
 
 
-CLASSES = (WTAIR_AnimClip, WTAIR_OT_prepare, WTAIR_OT_strip, WTAIR_OT_names, WTAIR_OT_revert, WTAIR_OT_sliders,
+CLASSES = (WTAIR_AnimClip, WTAIR_OT_smooth, WTAIR_OT_prepare, WTAIR_OT_strip, WTAIR_OT_names, WTAIR_OT_revert, WTAIR_OT_sliders,
            WTAIR_OT_retarget, WTAIR_OT_full, WTAIR_OT_reset, WTAIR_OT_report, WTAIR_PT_panel)
 
 
@@ -1110,6 +1162,9 @@ def register():
     bpy.types.Scene.wtair_strip_all = bpy.props.BoolProperty(
         name="All kinds", default=False,
         description="Remove every empty with nothing under it, not only loadout (pylon / weapon) nodes")
+    bpy.types.Scene.wtair_smooth = bpy.props.BoolProperty(
+        name="Smooth shading", default=True,
+        description="Prepare also does Shade Smooth on every mesh of the model")
 
 
 def unregister():
@@ -1118,7 +1173,7 @@ def unregister():
             bpy.utils.unregister_class(c)
         except Exception:
             pass
-    for p in ("wtair_clips", "wtair_rename", "wtair_group", "wtair_vehicle", "wtair_flat", "wtair_strip", "wtair_strip_all"):
+    for p in ("wtair_clips", "wtair_rename", "wtair_group", "wtair_vehicle", "wtair_flat", "wtair_strip", "wtair_strip_all", "wtair_smooth"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)
 
