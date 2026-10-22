@@ -53,6 +53,14 @@ except Exception as e:
     traceback.print_exc()
     sys.exit(1)
 
+# --- PHASE TIMING (temporary, removable: delete this block and phase_timing.py; WTX_TIMING=0 turns it off) ---
+try:
+    import phase_timing
+    print(phase_timing.install())
+except Exception as _timing_error:
+    print(f"[timing] not installed: {_timing_error}")
+# --- end PHASE TIMING ---
+
 
 def parse_vehicle_queries_from_file(file_path: Path) -> list[str]:
     """Reads a plain text list or a Windows 'tree /F /A' text export and extracts vehicle folder names dynamically."""

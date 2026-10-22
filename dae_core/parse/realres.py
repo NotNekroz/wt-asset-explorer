@@ -16,7 +16,7 @@ from struct import unpack, pack
 from parse.datablock import *
 from util.terminable import Packed, SafeRange, SafeIter, SafeEnumerate, Terminable
 from parse.mesh import MatVData, InstShaderMeshResource, ShaderMesh
-from parse.material import MaterialData, MaterialTemplateLibrary,  computeMaterialNames, TexturePathDict, swapVehicleTex, buildNetPaintedMasks, setNetPaintedMasks, writeBlenderShading
+from parse.material import MaterialData, MaterialTemplateLibrary, textureBatch,  computeMaterialNames, TexturePathDict, swapVehicleTex, buildNetPaintedMasks, setNetPaintedMasks, writeBlenderShading
 from abc import abstractmethod, ABC
 from math import sqrt
 
@@ -1184,45 +1184,47 @@ class Model(Terminable):
 
 			exported = set()
 
-			for mat in SafeIter(self, self.materials):
-				mat: MaterialData
+			# [WTX patch] the textures are planned here (shared state, one thread) and written by a worker pool when the block ends
+			with textureBatch():
+				for mat in SafeIter(self, self.materials):
+					mat: MaterialData
 
-				# Combine textures array with any t0, t1, t2 parameters
-				all_texs = list(mat.textures)
-				params = mat.getParams()
-				for key in ("t0", "t1", "t2", "camo_tex"):
-					val = swapVehicleTex(params.get(key))
-					if isinstance(val, str) and val and val not in all_texs:
-						all_texs.append(val)
+					# Combine textures array with any t0, t1, t2 parameters
+					all_texs = list(mat.textures)
+					params = mat.getParams()
+					for key in ("t0", "t1", "t2", "camo_tex"):
+						val = swapVehicleTex(params.get(key))
+						if isinstance(val, str) and val and val not in all_texs:
+							all_texs.append(val)
 
-				for tex in SafeIter(self, all_texs):
-					if mat.skipsCamoTexture(tex):       # skin preview: the skin replaces this diffuse, its camo is not needed
-						continue
-
-					for i in SafeRange(self, 2):
-						if i == 0:
-							texN = mat.checkModifiedName(
-								MaterialData.getTexFileName(tex), texturePaths
-							)
-							if texN == tex:
-								continue
-						else:
-							texN = None
-
-						# Same output file whether it is asked for as 'name' (pass 0) or 'name*' (pass 1) unless a modified variant ('namem') exists,
-						# so key on the file name; before, pass 1 never matched pass 0 and every texture was converted and written twice.
-						key = texN or MaterialData.getTexFileName(tex)
-
-						if key in exported:
+					for tex in SafeIter(self, all_texs):
+						if mat.skipsCamoTexture(tex):       # skin preview: the skin replaces this diffuse, its camo is not needed
 							continue
 
-						exported.add(key)
+						for i in SafeRange(self, 2):
+							if i == 0:
+								texN = mat.checkModifiedName(
+									MaterialData.getTexFileName(tex), texturePaths
+								)
+								if texN == tex:
+									continue
+							else:
+								texN = None
 
-						self.setSubTask(mat)
-						mat.exportTexture(
-							tex, output, forceConvert, texturePaths, texN
-						)
-						self.clearSubTask()
+							# Same output file whether it is asked for as 'name' (pass 0) or 'name*' (pass 1) unless a modified variant ('namem') exists,
+							# so key on the file name; before, pass 1 never matched pass 0 and every texture was converted and written twice.
+							key = texN or MaterialData.getTexFileName(tex)
+
+							if key in exported:
+								continue
+
+							exported.add(key)
+
+							self.setSubTask(mat)
+							mat.exportTexture(
+								tex, output, forceConvert, texturePaths, texN
+							)
+							self.clearSubTask()
 
 			log.subLevel()
 	

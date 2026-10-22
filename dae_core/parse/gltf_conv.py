@@ -138,6 +138,107 @@ def make_gltf_mr(src: Path) -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# [WTX patch] The normal / metal-roughness pictures are built ahead of the material loop, several at a time.
+# The material loop below still calls make_gltf_normal / make_gltf_mr exactly as before; when the pre-pass has already written a picture,
+# those calls find it and return at once. So the pre-pass can only make the loop faster: whatever it misses or fails on, the loop does itself
+# (and reports it itself). WTX_MAP_WORKERS (default 4; Settings > Performance) sets the pool size, 0 or 1 = no pool = the old behaviour.
+# ---------------------------------------------------------------------------------------------------------------------
+def _env_map_workers() -> int:
+    try:
+        return max(0, int(os.environ.get("WTX_MAP_WORKERS", "4")))
+    except ValueError:
+        return 4
+
+MAP_WORKERS = _env_map_workers()
+
+
+def _normal_stem_of(mat, slots) -> str | None:
+    """The normal map's texture stem of a material (its `normal`, else slot t2); None when it has none."""
+    raw_normal = getattr(mat, "normal", None)
+    if raw_normal:
+        return normalize_tex_name(raw_normal)
+    if len(slots) > 2 and slots[2]:
+        return normalize_tex_name(slots[2])
+    return None
+
+
+def _resolve_normal_src(tex_index: dict, normal_stem: str) -> str | None:
+    """The file in textures/ that make_gltf_normal reads for this normal map, or None."""
+    src = find_texture(tex_index, [normal_stem])
+    if src is None:
+        root = strip_known_suffix(normal_stem)
+        src = find_texture(tex_index, [normal_stem + s for s in NORMAL_SUFFIXES]
+                           + [root + s for s in NORMAL_SUFFIXES])
+    return src
+
+
+def _mr_source(mat, normal_stem: str | None, tex_index: dict) -> str | None:
+    """The *_n.dds that make_gltf_mr turns into the metal-roughness picture of this material, or None (glass, non-_n, no DDS)."""
+    cls_n = str(getattr(mat, "cls", "") or "").lower()
+    if normal_stem and normal_stem.lower().endswith("_n") and "glass" not in cls_n:
+        raw_n = find_texture(tex_index, [normal_stem])
+        if raw_n and raw_n.lower().endswith(".dds"):
+            return raw_n
+    return None
+
+
+def _map_worker_init() -> None:
+    try:
+        import util.log as _log
+        _log.setWorkerThread()          # own log indent, muted: the loop repeats (and reports) anything that failed here
+    except Exception:
+        pass
+
+
+def precompute_gltf_maps(mdl, tex_dir: Path, tex_index: dict) -> int:
+    """Build the <n>_gltf.png and <n>_mr.png pictures the material loop is going to ask for, on MAP_WORKERS threads.
+    Same pictures, same code (make_gltf_normal / make_gltf_mr), only earlier and in parallel. Returns how many conversions were submitted
+    (0 = nothing to do or no pool: MAP_WORKERS 0 or 1). Never raises."""
+    workers = MAP_WORKERS
+    if workers <= 1 or not tex_index:
+        return 0
+    try:
+        normals: dict[str, None] = {}
+        mrs: dict[str, None] = {}
+        for mat in (getattr(mdl, "materials", None) or []):
+            slots = _slot_list(mat)
+            normal_stem = _normal_stem_of(mat, slots)
+            if normal_stem:
+                if find_texture(tex_index, [normal_stem + "_gltf"]) is None:     # the loop only converts when no _gltf picture is listed
+                    src = _resolve_normal_src(tex_index, normal_stem)
+                    if src:
+                        normals[src] = None
+                raw_n = _mr_source(mat, normal_stem, tex_index)
+                if raw_n:
+                    mrs[raw_n] = None
+
+        jobs = [(make_gltf_normal, tex_dir / n) for n in normals] + [(make_gltf_mr, tex_dir / n) for n in mrs]
+        if len(jobs) < 2:
+            return 0
+
+        def size_of(job):
+            try:
+                return job[1].stat().st_size
+            except OSError:
+                return 0
+        jobs.sort(key=lambda j: -size_of(j))                 # the big pictures first: best packing on the workers
+
+        def run(job):
+            try:
+                job[0](job[1])
+            except Exception:
+                pass
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(workers, len(jobs)), thread_name_prefix="wtx-map",
+                                initializer=_map_worker_init) as pool:
+            list(pool.map(run, jobs))
+        return len(jobs)
+    except Exception:
+        return 0
+
+
 def index_texture_dir(tex_dir: Path) -> dict:
     """{(lowercase stem, lowercase ext): real file name} for every image in textures/."""
     index = {}
@@ -467,6 +568,8 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
             ))
         return default_mat_idx
 
+    if tex_index:
+        precompute_gltf_maps(mdl, tex_dir, tex_index)      # [WTX patch] the pictures the loop below needs, built several at a time
     net_mat_by_name = {}       # the same by glTF material name (the model can hold several materials with one name)
     net_mat_pair = {}          # glTF material index -> (diffuse, camo) of a net-class material with a camo
     for idx, mat in enumerate(getattr(mdl, "materials", None) or []):
@@ -492,22 +595,13 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
             color_file = find_texture(tex_index, color_cands)
 
             # Normal map: slot t2 (same as the OBJ's map_bump). Prefer the decoded <n>_gltf.png from material.py.
-            normal_stem = None
-            raw_normal = getattr(mat, "normal", None)
-            if raw_normal:
-                normal_stem = normalize_tex_name(raw_normal)
-            elif len(slots) > 2 and slots[2]:
-                normal_stem = normalize_tex_name(slots[2])
+            normal_stem = _normal_stem_of(mat, slots)
 
             normal_file = None
             if normal_stem:
                 normal_file = find_texture(tex_index, [normal_stem + "_gltf"])
                 if normal_file is None:
-                    src = find_texture(tex_index, [normal_stem])
-                    if src is None:
-                        root = strip_known_suffix(normal_stem)
-                        src = find_texture(tex_index, [normal_stem + s for s in NORMAL_SUFFIXES]
-                                           + [root + s for s in NORMAL_SUFFIXES])
+                    src = _resolve_normal_src(tex_index, normal_stem)
                     if src:
                         normal_file = make_gltf_normal(tex_dir / src) or src
 
@@ -518,15 +612,13 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
 
             # The _n also carries the gloss (red) and metal (blue) painting, the way the game reads it: show it for the game's own
             # normal maps and for a custom skin's alike. Glass keeps its own look, and only a *_n texture has that layout.
-            cls_n = str(getattr(mat, "cls", "") or "").lower()
-            if normal_stem and normal_stem.lower().endswith("_n") and "glass" not in cls_n:
-                raw_n = find_texture(tex_index, [normal_stem])
-                if raw_n and raw_n.lower().endswith(".dds"):
-                    mr_file = make_gltf_mr(tex_dir / raw_n)
-                    if mr_file:
-                        pbr.metallicRoughnessTexture = TextureInfo(index=get_texture_index(mr_file))
-                        pbr.metallicFactor = 1.0
-                        pbr.roughnessFactor = 1.0
+            raw_n = _mr_source(mat, normal_stem, tex_index)
+            if raw_n:
+                mr_file = make_gltf_mr(tex_dir / raw_n)
+                if mr_file:
+                    pbr.metallicRoughnessTexture = TextureInfo(index=get_texture_index(mr_file))
+                    pbr.metallicFactor = 1.0
+                    pbr.roughnessFactor = 1.0
 
         # Alpha by War Thunder shader class:
         #  *_atest -> cut-out; glass/alpha_blend -> blended;
@@ -765,4 +857,4 @@ def export_model_to_gltf(mdl, out_dir: str | Path, export_textures: bool = True)
     gltf.buffers[0].byteLength = len(blob)
     gltf.set_binary_blob(blob)
     gltf.save(str(glb_path))
-    return Path(glb_path)
+    return Path(glb_path)

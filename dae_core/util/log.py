@@ -3,6 +3,8 @@ from os import path
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
 
+import contextlib
+import threading
 from time import time
 from util.enums import *
 from threading import currentThread
@@ -27,9 +29,40 @@ def setSink(fn):
 	global sink
 	sink = fn
 
+# [WTX patch] per-thread state for the export worker threads. A thread that calls setWorkerThread() gets its own indent level
+# and (by default) logs nothing, so concurrent workers can neither corrupt the shared indent counter (it raises when it goes
+# negative) nor write into the GUI console from a non-GUI thread. Every other thread keeps using the module globals.
+_tls = threading.local()
+
+def setWorkerThread(muted:bool = True):
+	_tls.worker = True
+	_tls.level = 0
+	_tls.levelStr = ""
+	_tls.muted = bool(muted)
+
+@contextlib.contextmanager
+def muted():
+	"""Mute the log for the CURRENT thread only (setMuted() mutes every thread)."""
+	before = getattr(_tls, "muted", False)
+	_tls.muted = True
+	try:
+		yield
+	finally:
+		_tls.muted = before
+
 def incrLevel(level:int = 0):
 	global curLevel
 	global levelStr
+
+	if getattr(_tls, "worker", False):
+		_tls.level += level
+
+		if _tls.level < 0:
+			raise Exception(f"Impossible level {_tls.level}")
+
+		_tls.levelStr = "    " * _tls.level
+
+		return
 
 	curLevel += level
 	levelStr = ""
@@ -50,10 +83,13 @@ def subLevel(level:int = 1):
 def getLevelStr():
 	global levelStr
 
+	if getattr(_tls, "worker", False):
+		return _tls.levelStr
+
 	return levelStr
 
 def log(message:str, type:int = 0): # TODO: add multithreading support
-	if MUTED:
+	if MUTED or getattr(_tls, "muted", False):
 		return
 
 	if sink is not None:

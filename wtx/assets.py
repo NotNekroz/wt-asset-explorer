@@ -15,6 +15,8 @@ import contextlib
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -36,6 +38,17 @@ INDEX_VERSION = 4  # Bumped to support raw byte offset caching
 # Package folders under content*/ that are never read: this tool only exports vehicles. pkg_infantry holds infantry
 # weapons and costs ~2.5 s of Desc.bin parsing per run. Empty this tuple to bring it back.
 EXCLUDED_PKGS = ("pkg_infantry",)
+# [WTX patch] Parsed texture packs (the DDSx entry lists) are kept between exports, so a pack is read once per run, not once per export.
+# PACK_CACHE_MAX bounds the memory; PACK_WORKERS (env WTX_PACK_WORKERS) is how many packs are parsed at the same time (0 or 1 = one after the other).
+PACK_CACHE_MAX = 32
+try:
+    PACK_WORKERS = max(0, int(os.environ.get("WTX_PACK_WORKERS", "1")))
+except ValueError:
+    PACK_WORKERS = 1
+# Default 1: parsing a pack is pure Python, so threads gave no measurable gain (0.57 s one by one vs about 0.60 s with 4 threads).
+# The Performance section of Settings (wtx/tuning.py) changes PACK_WORKERS and CLEAR_PACK_CACHE at run time.
+# CLEAR_PACK_CACHE: every export starts with an empty texture-pack cache (cold packs each time), for fair timing comparisons.
+CLEAR_PACK_CACHE = False
 
 
 def _clean_tex_name(s: str) -> str:
@@ -111,6 +124,8 @@ class AssetLibrary:
         self.overrides: dict[str, dict] = {}
         self._overrides_path = self.cache_dir / "overrides.json"
         self._pack_batch = None                            # set of texture packs already in memory while a weapon batch runs (None = no batch)
+        self._pack_cache: dict[str, tuple] = {}            # dxp rel -> (file signature, [DDSx]); least recently used first. Only ever added to / evicted, never cleared per export
+        self._pack_cache_lock = threading.Lock()
         self.last_node_world: dict = {}                    # skeleton world matrices of the model export_obj built last
         self.vehicle_blk: Path | None = None               # BLK of the vehicle selected in the GUI: its default_skin says which camo it wears
         self._load_overrides()
@@ -118,7 +133,7 @@ class AssetLibrary:
     # ------------------------------------------------------------------ helpers
     def _rel(self, p: Path) -> str:
         return p.relative_to(self.game_dir).as_posix()
-    
+
     def _cache_grp_once(self, grp_rel: str, done: set) -> None:
         """Fallback when a .grp has no entry list in the index: cache every skeleton / collision / model in it."""
         if grp_rel in done:
@@ -757,7 +772,7 @@ class AssetLibrary:
                     cleaned = _clean_tex_name(tex)
                     if cleaned:
                         wanted.add(cleaned)
-            
+
             # Also extract texture names from dynamic/camo shader parameters (t1, camo_tex, etc.)
             try:
                 mat_params = mat.getParams() if hasattr(mat, "getParams") else {}
@@ -786,25 +801,67 @@ class AssetLibrary:
                 status(f"Model uses {len(wanted)} textures -> {len(packs)} texture pack(s) already loaded"
                        + (f" ({missing} not found in any pack)" if missing else ""))
                 return
-            packs = {k: None for k in (batch | set(packs))}     # reload the union so HQ packs still load last
+            packs = {k: None for k in (batch | set(packs))}     # register the union again so HQ packs still come last
         status(f"Model uses {len(wanted)} textures -> loading {len(packs)} texture pack(s)"
                + (f" ({missing} not found in any pack)" if missing else ""))
         AssetCacher.clearCache(DDSx)
 
-        # Sort so standard packs load FIRST and HQ packs load LAST (HQ DDSx textures overwrite standard ones in memory)
+        # Sort so standard packs come FIRST and HQ packs LAST. getBestTex keeps the first of two equally large textures, so this
+        # order still decides ties; the bigger texture wins whatever the order.
         sorted_pack_paths = sorted(packs.keys(), key=lambda p: 1 if "content.hq" in p.lower() else 0)
 
+        # Parse the packs that are not in the pack cache yet, several at a time. The workers only fill the cache (under its lock);
+        # AssetCacher is touched below, in order, by this thread alone.
+        cold = [rel for rel in sorted_pack_paths if self._cached_pack(rel) is None]
+        if len(cold) > 1 and PACK_WORKERS > 1:
+            with ThreadPoolExecutor(max_workers=min(PACK_WORKERS, len(cold)), thread_name_prefix="wtx-pack",
+                                    initializer=log.setWorkerThread) as pool:
+                list(pool.map(self._pack_entries, cold))      # a pack that cannot be read raises here, as it did before
+
         for rel in sorted_pack_paths:
-            log.setMuted(True)
-            try:
-                pack = DDSxTexturePack2(str(self.game_dir / rel))
-                for ddsx in pack.getPackedFiles():
-                    AssetCacher.cacheAsset(ddsx)
-            finally:
-                log.setMuted(False)
+            for ddsx in self._pack_entries(rel):
+                AssetCacher.cacheAsset(ddsx)
             status(f"  texture pack {rel.rsplit('/', 1)[-1]}")
             if batch is not None:
                 batch.add(rel)
+
+    def _begin_export(self) -> None:
+        """Called at the start of every export. With CLEAR_PACK_CACHE the texture-pack cache is emptied, so each export parses its packs
+        again. Never inside a weapon batch (_pack_batch is set): the weapon models share the packs of the export that started the batch."""
+        if CLEAR_PACK_CACHE and self._pack_batch is None:
+            with self._pack_cache_lock:
+                self._pack_cache.clear()
+
+    def _pack_signature(self, rel: str):
+        try:
+            st = (self.game_dir / rel).stat()
+            return (st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+
+    def _cached_pack(self, rel: str):
+        """The parsed entries of a texture pack if the pack cache holds them for the file as it is now, else None."""
+        sig = self._pack_signature(rel)
+        with self._pack_cache_lock:
+            hit = self._pack_cache.get(rel)
+            if hit is None or hit[0] != sig:
+                return None
+            self._pack_cache[rel] = self._pack_cache.pop(rel)      # most recently used goes last
+            return hit[1]
+
+    def _pack_entries(self, rel: str) -> list:
+        """The DDSx entries of one texture pack: from the pack cache, or parsed now (a cache miss) and kept. Safe to call from several threads."""
+        hit = self._cached_pack(rel)
+        if hit is not None:
+            return hit
+        sig = self._pack_signature(rel)
+        with log.muted():
+            entries = list(DDSxTexturePack2(str(self.game_dir / rel)).getPackedFiles())
+        with self._pack_cache_lock:
+            self._pack_cache[rel] = (sig, entries)
+            while len(self._pack_cache) > PACK_CACHE_MAX:
+                self._pack_cache.pop(next(iter(self._pack_cache)))
+        return entries
 
     @staticmethod
     def _prune_unused_textures(model_file, out_dir, status: Status) -> None:
@@ -852,7 +909,7 @@ class AssetLibrary:
 
         for cls in _CACHED_TYPES:
             AssetCacher.clearCache(cls)
-        
+
         self._preload_companions(ref.name, status)
 
         target = None
@@ -1011,6 +1068,7 @@ class AssetLibrary:
 
         skin_dir = Path(skin_dir)
         skin_dir.mkdir(parents=True, exist_ok=True)
+        self._begin_export()
 
         jobs = [(ref, ref.name)]
         seen = set()
@@ -1218,6 +1276,7 @@ class AssetLibrary:
         prune_unused: at the end, drop the materials / texture files the finished .obj does not use (see tex_prune).
         skin_dir: a custom-skin folder whose textures replace the game's in the finished export (the skin preview)."""
         log.subLevel(log.curLevel)
+        self._begin_export()
         grp_path = self.game_dir / ref.grp
         if not grp_path.exists():
             raise FileNotFoundError(f"GRP file not found: {grp_path}")
@@ -1227,7 +1286,7 @@ class AssetLibrary:
 
         for cls in _CACHED_TYPES:
             AssetCacher.clearCache(cls)
-        
+
         self._preload_companions(ref.name, status)
 
         target = None
@@ -1345,7 +1404,7 @@ class AssetLibrary:
         if prune_unused and textures:
             self._prune_unused_textures(obj_file, out_dir, status)
         return obj_file
-    
+
     def export_gltf(self, ref: AssetRef, out_dir: Path, status: Status, textures: bool = True, lod: int = 0,
                     animations: bool = True, strip_fx: bool = True, hide_nodes=None, mounts=None,
                     mirror_nodes=None, prune_unused: bool = True, skin_dir=None) -> Path:
@@ -1364,6 +1423,7 @@ class AssetLibrary:
         from parse.gltf_conv import export_model_to_gltf
 
         log.subLevel(log.curLevel)
+        self._begin_export()
         grp_path = self.game_dir / ref.grp
         if not grp_path.exists():
             raise FileNotFoundError(f"GRP file not found: {grp_path}")
@@ -1373,7 +1433,7 @@ class AssetLibrary:
 
         for cls in _CACHED_TYPES:
             AssetCacher.clearCache(cls)
-        
+
         self._preload_companions(ref.name, status)
 
         target = None
