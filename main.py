@@ -11,6 +11,19 @@ import re
 from pathlib import Path
 import traceback
 
+# Windowed build: every console child process (texconv.exe, wt_ext_cli.exe) would flash a cmd window.
+# Patch subprocess.Popen once so every call site (subprocess.run included) starts them hidden.
+if sys.platform == "win32":
+  import subprocess as _subprocess
+  _OrigPopen = _subprocess.Popen
+
+  class _NoWindowPopen(_OrigPopen):
+    def __init__(self, *args, **kwargs):
+      kwargs["creationflags"] = kwargs.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
+      super().__init__(*args, **kwargs)
+
+  _subprocess.Popen = _NoWindowPopen
+
 # 1. IMPORT PYSIDE6 FIRST (Prevents native DLL initialization crashes)
 try:
     from PySide6.QtCore import QCoreApplication, QStandardPaths
