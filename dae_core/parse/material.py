@@ -1,9 +1,5 @@
 import sys
 import os
-import contextlib
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from time import perf_counter
 from os import path, getcwd, mkdir, makedirs
 
 sys.path.append(path.dirname(path.dirname(path.abspath(__file__))))
@@ -83,10 +79,10 @@ class DDSx(Packed):
 	class Header:
 		def __repr__(self):
 			return f"<DDSxHeader {self.getFormattedData()}>"
-
+		
 		def getFormattedData(self):
 			return f"{self.d3dformat} {self.w}x{self.h}"
-
+		
 		def __init__(self, stream):
 			# Safely extract the raw 32 bytes regardless of stream type/wrapper
 			if hasattr(stream, "read"):
@@ -95,7 +91,7 @@ class DDSx(Packed):
 				raw = stream
 			else:
 				raw = bytes(stream)
-
+			
 			if len(raw) < 32:
 				raise ValueError(f"DDSx header expected 32 bytes, got {len(raw)}")
 
@@ -131,11 +127,11 @@ class DDSx(Packed):
 		def getBin(self):
 			label_b = self.label.encode("latin1") if isinstance(self.label, str) else self.label
 			fmt_b = self.d3dformat.encode("latin1") if isinstance(self.d3dformat, str) else self.d3dformat
-			return pack("4s4sIHHBBHHBBII", 	label_b,
-											fmt_b,
-											self.cMethod * 0x1000000 + self.flags,
-											self.w,
-											self.h,
+			return pack("4s4sIHHBBHHBBII", 	label_b, 
+											fmt_b, 
+											self.cMethod * 0x1000000 + self.flags, 
+											self.w, 
+											self.h, 
 											self.levels,
 											self.hqPartLevels,
 											self.depth,
@@ -220,7 +216,7 @@ class DDSx(Packed):
 	)
 
 	__DX10_FORMATS = (
-		b"BC7 ",
+		b"BC7 ", 
 		b"BC7 "
 	)
 
@@ -228,25 +224,25 @@ class DDSx(Packed):
 	@property
 	def classIconName(self) -> str:
 		return "asset_tex.bmp"
-
+	
 	@classmethod
 	@property
 	def classNiceName(cls) -> str:
 		return "DDSx"
-
+	
 	@classmethod
 	@property
 	def fileExtension(cls) -> str:
 		return "ddsx"
-
+	
 	def __repr__(self):
 		return f"<DDsX {self.name}: {self.__header.getFormattedData()}>"
 
-	def __init__(self,
-		  filePath:str,
-		  name:str = None,
-		  size:int = 0,
-		  dataOffset:int = DDSX_HEADER_SIZE,
+	def __init__(self, 
+		  filePath:str, 
+		  name:str = None, 
+		  size:int = 0, 
+		  dataOffset:int = DDSX_HEADER_SIZE, 
 		  header:Header = None):
 		super().__init__(filePath, name, size, dataOffset)
 
@@ -265,12 +261,12 @@ class DDSx(Packed):
 			raise NotImplementedError(f"Missing header for packed DDSx (ofs={dataOffset})")
 		else:
 			self.__singleFile = False
-
+		
 		self.__header = header
 
 		self._setSize(self.__header.packedSz)
 		self._setValid()
-
+	
 	def __decompress__(self, data:bytes):
 		cMethod = self.__header.cMethod
 
@@ -284,12 +280,12 @@ class DDSx(Packed):
 			data = zlibDecompress(data)
 		elif cMethod == 0x40:
 			data = lzmaDecompress(data)
-
+		
 		return data
 
 	def getPixelCnt(self):
 		return self.__header.w * self.__header.h
-
+	
 	def getMipSize(self, width:int, height:int, dxtVersion:bytes):
 		dxtSize = max(1, (width + 3) // 4) * max(1, (height + 3) // 4)
 
@@ -304,7 +300,7 @@ class DDSx(Packed):
 
 	def getData(self):
 		return self.__decompress__(self.getBin().read())
-
+	
 	def save(self, output:str = getcwd()):
 		self._save(output, self.__header.getBin() + self.getBin().read())
 
@@ -327,7 +323,7 @@ class DDSx(Packed):
 
 		if self.__header.flags & 0x40000:
 			log.log("Found reversed mip order")
-
+			
 			pos = 0
 			images = []
 
@@ -343,7 +339,7 @@ class DDSx(Packed):
 
 			for image in SafeReversed(self, images):
 				data.extend(image)
-
+		
 		if d3dformat in self.__DX10_FORMATS:
 			log.log("Found DX10 texture")
 
@@ -364,7 +360,7 @@ class DDSx(Packed):
 			packInto('I', ddsData, 0x14, self.__header.memSz)
 			packInto('B', ddsData, 0x1c, self.__header.levels)
 			packInto('4s', ddsData, 0x54, d3dformat)
-
+		
 		data = ddsData.raw + data
 
 		log.log(f"Done: final size = {len(data)}")
@@ -372,23 +368,23 @@ class DDSx(Packed):
 		log.subLevel()
 
 		return data
-
+	
 	@property
 	def isSingleFile(self):
 		return self.__singleFile
-
+	
 	def getParentName(self):
 		if self.isSingleFile:
 			return path.basename(path.dirname(self.filePath))
 		else:
 			fName = path.basename(self.filePath).split(".")[0]
-
+			
 			if fName.endswith("-hq"):
 				fName = fName[:-3]
-
+			
 			if fName.startswith("hq_tex"):
 				fName = fName[7:]
-
+			
 			return fName
 
 	def exportDDS(self, output:str = getcwd()):
@@ -420,12 +416,12 @@ class DDSxTexturePack2(Pack): # TODO: Add logs
 	@property
 	def classNiceName(cls) -> str:
 		return "DDSx Texture Pack"
-
+	
 	@classmethod
 	@property
 	def fileExtension(cls) -> str:
 		return "dxp.bin"
-
+	
 	def __init__(self, filePath:str, name:str = None):
 		super().__init__(filePath, name)
 
@@ -433,7 +429,7 @@ class DDSxTexturePack2(Pack): # TODO: Add logs
 		self._setValid()
 
 		self.__pulledAll = False
-
+	
 	def __readFile__(self):
 		f = open(self.filePath, "rb")
 		f.seek(0x8, 1)
@@ -468,9 +464,9 @@ class DDSxTexturePack2(Pack): # TODO: Add logs
 
 			if ddsx is not None:
 				self.__files.append(ddsx)
-
+		
 		file.close()
-
+	
 	def __readDDSx__(self, file:BinFile, id:int):
 		name = self.__nameMap[id]
 
@@ -489,13 +485,13 @@ class DDSxTexturePack2(Pack): # TODO: Add logs
 			file.seek(self.__ddsxRecordsOfs + id * 0x18, 0)
 
 			offset = readInt(file)
-
+			
 			ddsx = DDSx(self.filePath, name, header.memSz, offset, header)
 
 		log.subLevel()
 
 		return ddsx
-
+	
 	@staticmethod
 	def peekNames(filePath:str) -> list[str]:
 		"""[WTX patch] reads only the name table of a dxp.bin (no DDSx objects) - used to index textures quickly."""
@@ -522,21 +518,21 @@ class DDSxTexturePack2(Pack): # TODO: Add logs
 		assert id >= 0 and id <= len(self.__files)
 
 		return self.__files[id]
-
+	
 	def getDDSxByName(self, name:str):
 		for k, v in SafeRange(self, self.__nameMap):
 			if v == name:
 				return self.getDDSxById(k)
-
+				
 		return None
-
+	
 	def getPackedFiles(self) -> list[DDSx, False]:
 		return self.__files
 
 def ftm(tex:str): # format texture to material
 	tex = tex.split("*")[0]
 	splitted = tex.split("_")
-
+	
 	noTex = True
 
 	for i in range(len(splitted) - 1, 0, -1):
@@ -545,15 +541,15 @@ def ftm(tex:str): # format texture to material
 		if part == "tex":
 			if i + 1 < len(splitted) and len(splitted[i + 1]) <= 2:
 				splitted.pop(i + 1)
-
+			
 			splitted.pop(i)
 			noTex = False
 
 			break
-
+	
 	if noTex and len(splitted[-1]) < 2:
 		splitted.pop()
-
+	
 	return "_".join(splitted)
 
 def addComp(list:list[str], comp:str):
@@ -562,7 +558,7 @@ def addComp(list:list[str], comp:str):
 
 def getBestTex(self:Terminable, ddsx:list[DDSx]):
 	best = ddsx[0]
-
+	
 	for i in SafeRange(self, 1, len(ddsx)):
 		cur = ddsx[i]
 
@@ -575,7 +571,7 @@ class TexturePathDict:
 	class Texture:
 		def __repr__(self):
 			return f"<{self.tex}:{self.texType}>"
-
+		
 		def __init__(self, tex:str, texType:int, texPath:str):
 			self.__tex = tex
 			self.__texType = texType
@@ -592,22 +588,22 @@ class TexturePathDict:
 		@property
 		def newName(self):
 			return self.__newName
-
+		
 		@property
 		def tex(self):
 			return self.__tex
-
+		
 		@property
 		def texType(self):
 			return self.__texType
-
+		
 		@property
 		def texPath(self):
 			return self.__texPath
-
+	
 	def __init__(self, customPath:str = None):
 		self.__d:dict[str, TexturePathDict.Texture] = {}
-
+		
 		if customPath is None:
 			self.__customPath = "models"
 		else:
@@ -622,13 +618,13 @@ class TexturePathDict:
 			return f"{self.customPath}/{cachedDDSx.getParentName()}"
 		else:
 			return self.customPath
-
+	
 	def get(self, texName:str):
 		return self.__d.get(texName)
 
-	def append(self,
-			texName:str,
-			texType:int,
+	def append(self, 
+			texName:str, 
+			texType:int, 
 			vmt:list[str],
 			vmtKey:str):
 		texName = MaterialData.getTexFileName(texName)
@@ -639,7 +635,7 @@ class TexturePathDict:
 			texName = tex.newName
 
 		vmt.append(f'${vmtKey} "{texPath}/{texName}"')
-
+		
 		self.__d[texName] = tex
 
 		return tex
@@ -651,140 +647,10 @@ class TexturePathDict:
 	def customPath(self):
 		return self.__customPath
 
-# ---------------------------------------------------------------------------------------------------------------------
-# [WTX patch] Texture export in two halves, so the slow half can run on worker threads.
-#   plan (the calling thread): MaterialData._planTexture() - everything that reads shared state (skin overrides, the camo swaps,
-#       MaterialData._exportedTextures, the AssetCacher texture cache). It resolves the texture to ONE DDSx object and the final output file and
-#       returns a TextureJob: plain data.
-#   execute (worker threads): MaterialData._runTextureJob() - read + decompress the DDSx, convert it, write the file. It reads no module global.
-# A TextureBatch collects the jobs of one export stage and runs them when it is flushed. Without an active batch exportTexture() runs
-# its job at once, in the calling thread, exactly like the code it replaces. WTX_TEX_WORKERS (default 4) sets the pool size; 0 or 1 = no pool.
-# ---------------------------------------------------------------------------------------------------------------------
-def _envWorkers() -> int:
-	try:
-		return max(0, int(os.environ.get("WTX_TEX_WORKERS", "4")))
-	except ValueError:
-		return 4
-
-TEXTURE_WORKERS = _envWorkers()
-
-class TextureJob:
-	__slots__ = ("mat", "texture", "ddsx", "outFile", "doneKey", "texturePaths", "forceConvert", "texN", "pixels", "size", "error", "seconds")
-
-	def __init__(self, mat, texture, ddsx, outFile, doneKey, texturePaths, forceConvert, texN):
-		self.mat, self.texture, self.ddsx, self.outFile, self.doneKey = mat, texture, ddsx, outFile, doneKey
-		self.texturePaths, self.forceConvert, self.texN = texturePaths, forceConvert, texN
-		self.pixels = ddsx.getPixelCnt()
-		self.size = 0
-		self.error = None
-		self.seconds = 0.0
-
-	def __repr__(self):
-		return f"<TextureJob {path.basename(self.outFile)}>"
-
-class TextureBatch:
-	last = {}     # statistics of the most recent flush: jobs, workers, wall (pool open time), busy (summed job time). Read by phase_timing.py
-
-	def __init__(self, workers: int = None, raise_errors: bool = True):
-		self.workers = TEXTURE_WORKERS if workers is None else workers
-		self.raise_errors = raise_errors
-		self.jobs: list[TextureJob] = []
-		self.queued: set = set()      # doneKeys of the jobs waiting here: their files do not exist yet
-
-	def add(self, job: TextureJob):
-		self.jobs.append(job)
-		self.queued.add(job.doneKey)
-
-	@staticmethod
-	def _runGroup(group: list):
-		"""All the jobs that write ONE output file, in the order they were requested (the last one wins, as it always did)."""
-		for job in group:
-			t0 = perf_counter()
-
-			try:
-				job.size = job.mat._runTextureJob(job)
-			except Exception as e:
-				job.error = e
-
-			job.seconds = perf_counter() - t0
-
-	def flush(self):
-		"""Run every queued job and return when all the files are written. Raises the first error afterwards if raise_errors is set."""
-		jobs, self.jobs = self.jobs, []
-		self.queued = set()
-
-		if not jobs:
-			return
-
-		groups: dict[str, list[TextureJob]] = {}
-
-		for job in jobs:
-			groups.setdefault(job.outFile, []).append(job)
-
-		ordered = sorted(groups.values(), key = lambda g: -max(j.pixels for j in g))     # the big ones first: best packing on the workers
-		workers = min(self.workers, len(ordered))
-		t0 = perf_counter()
-
-		try:
-			if workers <= 1:
-				for group in ordered:
-					self._runGroup(group)
-			else:
-				with ThreadPoolExecutor(max_workers = workers, thread_name_prefix = "wtx-tex", initializer = log.setWorkerThread) as pool:
-					futures = [pool.submit(self._runGroup, group) for group in ordered]
-
-					for f in futures:
-						f.result()
-		finally:
-			TextureBatch.last = {"jobs": len(jobs), "workers": max(1, workers), "wall": perf_counter() - t0,
-			                     "busy": sum(j.seconds for j in jobs)}
-
-		first = None
-
-		for job in jobs:     # the log lines the workers did not write, in request order, from this thread
-			if job.error is not None:
-				first = first or job.error
-				print(f"[WARNING] Failed to export texture {job.texture}: {job.error}")
-			else:
-				log.log(f"Wrote {job.size} bytes to {job.outFile}")
-
-		if first is not None and self.raise_errors:
-			raise first
-
-_batchTls = threading.local()
-
-def activeTextureBatch():
-	return getattr(_batchTls, "batch", None)
-
-@contextlib.contextmanager
-def textureBatch(raise_errors: bool = True):
-	"""Collect the exportTexture() calls made inside the block and run them, in parallel, when the block ends.
-	Nested use joins the outer batch (the outer block flushes). Call .flush() inside the block to have the files before it ends."""
-	outer = activeTextureBatch()
-
-	if outer is not None:
-		yield outer
-
-		return
-
-	batch = TextureBatch(raise_errors = raise_errors)
-	_batchTls.batch = batch
-
-	try:
-		yield batch
-	except BaseException:
-		_batchTls.batch = None
-		batch.jobs, batch.queued = [], set()     # an error or a cancel: the textures not written yet are dropped, not worked off
-
-		raise
-	else:
-		_batchTls.batch = None
-		batch.flush()
-
 class MaterialData(Terminable):
 	def __repr__(self):
 		return f"<MaterialData {self.getName()}>"
-
+	
 	def __init__(self):
 		self.__name:str = None
 		self.__params:dict[str, str] = None
@@ -801,7 +667,7 @@ class MaterialData(Terminable):
 		self.__detailNormalList:list[str, None] = None
 		self.__textureSlots:list[str] = [None for _ in range(11)]
 		self._rawTextures:list[str] = []
-
+	
 	@property
 	def textures(self) -> list[str]:
 		"""The material's textures as the game loads them on the current vehicle (see swapVehicleTex)."""
@@ -815,19 +681,19 @@ class MaterialData(Terminable):
 					out.append(extra)
 
 		return out
-
+	
 	def isLayered(self):
 		return self.cls.find("layered") != -1
-
+	
 	def isDynamic(self):
 		return self.cls.find("dynamic") != -1
-
+	
 	def __generateName__(self):
 		if len(self._rawTextures) == 0:
 			return self.cls
-
+		
 		components:list[str] = []
-
+		
 		if not self.isLayered():
 			addComp(components, self.__textureSlots[0])
 			addComp(components, self.__textureSlots[1])
@@ -836,7 +702,7 @@ class MaterialData(Terminable):
 
 		if not self.isDynamic() or self.isLayered():
 			detailStart = 3
-
+		
 		for i in range(detailStart, len(self.__textureSlots), 2):
 			detail = self.__textureSlots[i]
 
@@ -864,20 +730,20 @@ class MaterialData(Terminable):
 
 		self.__textureSlots[slotIdx] = tex
 		self._rawTextures.append(tex)
-
+	
 	def getName(self):
 		if self.__name is None:
 			self.__name = self.__generateName__()
-
+		
 		return self.__name
-
+	
 	def setName(self, name:str):
 		self.__name = name
-
+	
 	def getParams(self):
 		if self.__params is None:
 			params = {}
-
+			
 			paramL = self.par.split("\n")
 
 			for param in SafeIter(self, paramL):
@@ -948,7 +814,7 @@ class MaterialData(Terminable):
 
 		print(f"[SKIP] Failed to convert texture: {texture}")
 		return data, newName
-
+	
 	_exportedTextures = set()  # (output file, forceConvert, texN) already written by this process
 
 	def skipsCamoTexture(self, tex) -> bool:
@@ -1015,8 +881,7 @@ class MaterialData(Terminable):
 		log.log(f"Skin texture {path.basename(src)} -> {name}.dds")
 		return True
 
-	def _planTexture(self, texture:str, output:str = getcwd(), forceConvert:bool = False, texturePaths:TexturePathDict = None, texN:str = None):
-		"""Main-thread half of exportTexture: reads every shared state and returns a TextureJob, or None when there is nothing left to write."""
+	def exportTexture(self, texture:str, output:str = getcwd(), forceConvert:bool = False, texturePaths:TexturePathDict = None, texN:str = None):
 		outpath = path.join(output, "textures")
 
 		skinSrc = skinOverride(texture)
@@ -1024,7 +889,7 @@ class MaterialData(Terminable):
 		if skinSrc is not None and texN in (None, str(texture).split("*")[0]):
 			try:
 				self._exportSkinTexture(str(texture).split("*")[0], skinSrc, outpath)
-				return None
+				return
 			except Exception as e:
 				print(f"[WARNING] Skin texture {path.basename(skinSrc)} not used ({type(e).__name__}: {e}); extracting the game's {texture} instead")
 
@@ -1033,17 +898,14 @@ class MaterialData(Terminable):
 		doneKey = (path.abspath(path.join(outpath, str(texture).split("*")[0] + ".dds")), forceConvert,
 		           None if texN == str(texture).split("*")[0] else texN)
 
-		batch = activeTextureBatch()
-
-		# a file that is only queued does not exist yet: the batch knows it
-		if doneKey in MaterialData._exportedTextures and (path.exists(doneKey[0]) or (batch is not None and doneKey in batch.queued)):
-			return None
+		if doneKey in MaterialData._exportedTextures and path.exists(doneKey[0]):
+			return
 
 		MaterialData._exportedTextures.add(doneKey)
 
 		if not path.exists(outpath):
 			mkdir(outpath)
-
+			
 		name = texture.split("*")[0]
 
 		ddsx:list[DDSx] = AssetCacher.getCachedAsset(DDSx, name)
@@ -1052,61 +914,38 @@ class MaterialData(Terminable):
 			log.log(f"[WARNING] Texture {name} not found in cache. Attempting fallback search...")
 			# Safely handle cache lookup without relying on missing class methods
 			try:
-				# Try querying lowercase or generic variants directly from the cacher dictionary if exposed,
+				# Try querying lowercase or generic variants directly from the cacher dictionary if exposed, 
 				# otherwise fall back to checking if a texture pack can provide it.
 				ddsx = AssetCacher.getCachedAsset(DDSx, name.lower())
 			except Exception:
 				pass
-
+			
 		if not ddsx:
 			log.log(f"{name} not found anywhere in cache, skipping.")
-			return None
+			return
+		
+		data = getBestTex(self, ddsx).getDDS()
+		data, texN = self.convertTex(texture, data, texturePaths, forceConvert, texN)
 
-		best = getBestTex(self, ddsx)
+		if texN is not None:
+			name = texN
 
-		# the file name convertTex will report (the renamed variant of a masked texture), worked out here without converting anything
-		entry = texturePaths.get(texture if texN is None else texN) if texturePaths is not None else None
+		output = path.join(outpath, f"{name}.dds")
 
-		if entry is not None and entry.newName is not None:
-			name = entry.newName
-
-		return TextureJob(self, texture, best, path.join(outpath, f"{name}.dds"), doneKey, texturePaths, forceConvert, texN)
-
-	def _runTextureJob(self, job:TextureJob) -> int:
-		"""Worker half of exportTexture: decompress, convert, write. Reads no module global (everything it needs is in the job). Returns the byte count."""
-		data = job.ddsx.getDDS()
-		data, _ = self.convertTex(job.texture, data, job.texturePaths, job.forceConvert, job.texN)
-
-		file = open(job.outFile, "wb")
+		file = open(output, "wb")
 		file.write(data)
 		file.close()
 
-		return len(data)
-
-	def exportTexture(self, texture:str, output:str = getcwd(), forceConvert:bool = False, texturePaths:TexturePathDict = None, texN:str = None):
-		job = self._planTexture(texture, output, forceConvert, texturePaths, texN)
-
-		if job is None:
-			return
-
-		batch = activeTextureBatch()
-
-		if batch is not None:
-			batch.add(job)     # written when the batch is flushed
-			return
-
-		size = self._runTextureJob(job)
-
-		log.log(f"Wrote {size} bytes to {job.outFile}")
-
+		log.log(f"Wrote {len(data)} bytes to {output}")
+	
 	def getDMF(self):
 		buffer = BBytesIO()
 
 		name = self.getName()
-
+		
 		buffer.writeString(name)
 		buffer.writeString(self.cls)
-
+		
 		buffer.write(pack("ffff", *self.diff))
 		buffer.write(pack("ffff", *self.amb))
 		buffer.write(pack("ffff", *self.emis))
@@ -1114,7 +953,7 @@ class MaterialData(Terminable):
 
 		for tex in SafeIter(self, self.__textureSlots):
 			buffer.writeString(tex)
-
+		
 		params = self.getParams()
 
 		buffer.writeInt(len(params))
@@ -1153,11 +992,11 @@ class MaterialData(Terminable):
 			return self.__detailNormalList[0]
 		else:
 			return self.__textureSlots[2]
-
+	
 	@property
 	def mask(self):
 		return self.__textureSlots[1]
-
+	
 	def __initDetailList__(self):
 		if self.__detailList is None:
 			detailList = []
@@ -1168,7 +1007,7 @@ class MaterialData(Terminable):
 
 				if not self.isDynamic() or self.isLayered():
 					detailStart = 3
-
+				
 				for i in range(detailStart, len(self.__textureSlots), 2):
 					tex = self.__textureSlots[i]
 
@@ -1178,11 +1017,11 @@ class MaterialData(Terminable):
 						tex = self.__textureSlots[i + 1]
 
 						detailNormalList.append(tex)
-
+			
 			self.__detailNormalList = detailNormalList
 			self.__detailList = detailList
 
-	@property
+	@property 
 	def detail(self):
 		self.__initDetailList__()
 
@@ -1190,8 +1029,8 @@ class MaterialData(Terminable):
 			return self.__detailList[1:]
 		else:
 			return self.__detailList
-
-	@property
+	
+	@property 
 	def detailNormal(self):
 		self.__initDetailList__()
 
@@ -1219,10 +1058,10 @@ class MaterialData(Terminable):
 
 		if self.diffuse is not None:
 			texType = TEXTURE_GENERIC
-
+			
 			if self.cls.find("masked") != -1:
 				texType = TEXTURE_MASKED
-
+			
 			diffuse = texturePaths.append(self.diffuse, texType, vmt, "basetexture")
 
 			if self.detail1IsDiffuse():
@@ -1241,7 +1080,7 @@ class MaterialData(Terminable):
 				tileParam = "detail2"
 			else:
 				tileParam = "detail1"
-
+			
 			mask = detail[0]
 		else:
 			tileParam = "mask"
@@ -1480,6 +1319,69 @@ def decodeGlossMetalForObj(ddsPath: str):
 		return rough, metal
 	except Exception as e:
 		print(f"[WARNING] Could not build the gloss / metal maps of {ddsPath} for the OBJ: {e}")
+		return None
+
+def _normalRgbFromArr(arr):
+	"""The game's packed _n array (X in alpha, Y in green) -> (h, w, 3) uint8 RGB tangent-space normal map. The very maths of decodeNormalForGltf."""
+	import numpy as np
+
+	nx = arr[..., 3].astype(np.float32)
+	ny = arr[..., 1].astype(np.float32)
+	nx *= 2.0 / 255.0
+	nx -= 1.0
+	ny *= 2.0 / 255.0
+	ny -= 1.0
+
+	if NORMAL_FLIP_G:
+		np.negative(ny, out=ny)
+
+	nz = 1.0 - nx * nx - ny * ny
+	np.clip(nz, 0.0, 1.0, out=nz)
+	np.sqrt(nz, out=nz)
+
+	out = np.empty(arr.shape[:2] + (3,), dtype=np.uint8)
+	out[..., 0] = (nx * 127.5 + 127.5 + 0.5).astype(np.uint8)
+	out[..., 1] = (ny * 127.5 + 127.5 + 0.5).astype(np.uint8)
+	out[..., 2] = (nz * 127.5 + 127.5 + 0.5).astype(np.uint8)
+	return out
+
+def buildObjNormalMaps(ddsPath: str, withGlossMetal: bool):
+	"""OBJ_SRGB_PREENCODE only. <n>_normal_s.png, <n>_rough_s.png and <n>_metal_s.png straight from the <n>.dds in ONE read, with no
+	intermediate <n>_gltf.png (the old chain wrote that PNG, read it back and wrote the _s copy: two PNG encodes and a PNG decode per normal map).
+	Same pixels as decodeNormalForObjSrgb + decodeGlossMetalForObj. Safe to run for several maps at once (numpy / zlib release the GIL)."""
+	try:
+		import numpy as np
+		base = path.splitext(ddsPath)[0]
+		nDst, rDst, mDst = base + "_normal_s.png", base + objRoughSuffix(), base + objMetalSuffix()
+
+		if not path.exists(ddsPath):
+			return None
+
+		srcTime = path.getmtime(ddsPath)
+		needNormal = not path.exists(nDst)   # like the old chain: an existing normal is kept (a skin's stale one is deleted when the skin is written)
+		needGloss = withGlossMetal and not all(path.exists(p) and path.getmtime(p) >= srcTime for p in (rDst, mDst))
+
+		if not needNormal and not needGloss:
+			return nDst
+
+		arr = readDdsRgba(ddsPath)
+
+		if arr is None:
+			img = Image.open(ddsPath).convert("RGBA")
+			arr = np.asarray(img)
+			img.close()
+
+		if needNormal:
+			Image.fromarray(np.ascontiguousarray(srgbEncodeU8(_normalRgbFromArr(arr))), "RGB").save(nDst, compress_level=1)
+
+		if needGloss:
+			roughArr, metalArr = glossMetalMaps(arr, path.basename(base))
+			Image.fromarray(np.ascontiguousarray(srgbEncodeU8(roughArr)), "L").save(rDst, compress_level=1)
+			Image.fromarray(np.ascontiguousarray(srgbEncodeU8(metalArr)), "L").save(mDst, compress_level=1)
+
+		return nDst
+	except Exception as e:
+		print(f"[WARNING] Could not build the normal / gloss / metal maps of {ddsPath} for the OBJ: {e}")
 		return None
 
 def hasGlossMetal(normalName, cls) -> bool:
@@ -2092,13 +1994,13 @@ class MaterialTemplateLibrary(Terminable):
 				if hasGlossMetal(norm_tex, getattr(material, "cls", None)):
 					self.setParam("map_Pr", "textures/" + norm_tex + objRoughSuffix())
 					self.setParam("map_Pm", "textures/" + norm_tex + objMetalSuffix())
-
+		
 		def setParam(self, name, value):
 			if value == None:
 				return
-
+			
 			self.params[name] = value
-
+		
 		def getFormattedParams(self):
 			formatted = ""
 
@@ -2118,7 +2020,7 @@ class MaterialTemplateLibrary(Terminable):
 							)
 						except Exception as e:
 							print(f"[WARNING] Failed to export texture slot {clean_name}: {e}")
-
+		
 		def __exportNormal__(self, outpath:str, forceConvert:bool):
 			self.material.exportTexture(self.material.normal, outpath, forceConvert = forceConvert)
 
@@ -2129,7 +2031,7 @@ class MaterialTemplateLibrary(Terminable):
 
 	def __init__(self, materials:list[MaterialData]):
 		self.__mats = tuple(self.Material(material) for material in SafeIter(self, materials))
-
+	
 	def getMTL(self):
 		mtl = ""
 
@@ -2137,52 +2039,87 @@ class MaterialTemplateLibrary(Terminable):
 			mtl += f"{v}"
 
 		return mtl
-
+	
 	def exportTextures(self, outpath: str = getcwd(), forceConvert: bool = False):
 		log.log("Exporting MTL textures")
 		log.addLevel()
 
+		import time as _time
+		_tm = _time.perf_counter()
+		_stages = {}
+
+		def _lap(name):
+			nonlocal _tm
+			_now = _time.perf_counter()
+			_stages[name] = _stages.get(name, 0.0) + (_now - _tm)
+			_tm = _now
+
+		def _report():
+			log.log("OBJ texture timing: " + " | ".join(f"{k} {v:.1f} s" for k, v in _stages.items()))
+
 		# [REMOVED in cleanup] `has_dynamic_camo = False`  (material.py line 1354 of the pre-cleanup file, start of
 		#   MaterialTemplateLibrary.exportTextures). Initial value of the per-model camo flag described in the note inside the loop below.
 
-		# [WTX patch] textures are planned in this loop and written by the worker pool; the decodes below need the files, so flush first
-		with textureBatch(raise_errors = False) as batch:
-			for mat in SafeIter(self, self.__mats):
-				mat: MaterialTemplateLibrary.Material
+		for mat in SafeIter(self, self.__mats):
+			mat: MaterialTemplateLibrary.Material
 
-				log.log(f"Exporting textures from {mat.material.getName()}")
-				log.addLevel()
+			log.log(f"Exporting textures from {mat.material.getName()}")
+			log.addLevel()
 
-				mat.exportTextures(outpath, forceConvert)
+			mat.exportTextures(outpath, forceConvert)
+			_lap("diffuse+normal files")
 
-				# [REMOVED in cleanup] per-material "does this model use dynamic camo?" gate  (material.py lines 1364-1369 of the pre-cleanup
-				#   file, inside MaterialTemplateLibrary.exportTextures, in the per-material loop right after mat.exportTextures()).
-				#   What it did: lower-cased mat.material.cls and set `has_dynamic_camo = True` when the class contained one of
-				#   "tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted" and none of "aircraft", "cockpit", "building".
-				#   Worked with: the `has_dynamic_camo` flag (below, removed too), which the original bake step used to decide whether to
-				#   bake at all. The same lists now live in CAMO_CLASS_KEYS / CAMO_CLASS_EXCLUDED and isCamoClass(), and the bake
-				#   step collects (diffuse, camo) pairs through getCamoPair(), so the flag was written but never read.
+			# [REMOVED in cleanup] per-material "does this model use dynamic camo?" gate  (material.py lines 1364-1369 of the pre-cleanup
+			#   file, inside MaterialTemplateLibrary.exportTextures, in the per-material loop right after mat.exportTextures()).
+			#   What it did: lower-cased mat.material.cls and set `has_dynamic_camo = True` when the class contained one of
+			#   "tank", "ground", "ship", "boat", "dynamic_masked", "dynamic_painted" and none of "aircraft", "cockpit", "building".
+			#   Worked with: the `has_dynamic_camo` flag (below, removed too), which the original bake step used to decide whether to
+			#   bake at all. The same lists now live in CAMO_CLASS_KEYS / CAMO_CLASS_EXCLUDED and isCamoClass(), and the bake
+			#   step collects (diffuse, camo) pairs through getCamoPair(), so the flag was written but never read.
 
-				log.subLevel()
-
-			batch.flush()
+			log.subLevel()
 
 		# OBJ normal maps: decode the packed <n>.dds into <n>_obj.dds (what map_bump points at). The GLB export builds
 		# its own png (gltf_conv.make_gltf_normal) and never goes through this method.
-		for mat in SafeIter(self, self.__mats):
-			if mat.material.normal is not None:
-				normName = str(mat.material.normal).split("*")[0]
-				if normName.lower().endswith(".dds"):
-					normName = normName[:-4]
-				if OBJ_SRGB_PREENCODE:
-					decodeNormalForObjSrgb(path.join(outpath, "textures", f"{normName}.dds"))
-				elif OBJ_NORMAL_GLTF_PNG:
-					decodeNormalForGltf(path.join(outpath, "textures", f"{normName}.dds"))
-				else:
-					decodeNormalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+		if OBJ_SRGB_PREENCODE:
+			# One read per distinct normal map, straight to the three pre-encoded pictures, several maps at once (PNG encoding is the cost here
+			# and releases the GIL). Before: per material, DDS -> _gltf.png -> back -> _normal_s.png, then the DDS read again for gloss / metal.
+			jobs = {}
 
-				if hasGlossMetal(normName, getattr(mat.material, "cls", None)):
-					decodeGlossMetalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+			for mat in SafeIter(self, self.__mats):
+				if mat.material.normal is not None:
+					normName = str(mat.material.normal).split("*")[0]
+
+					if normName.lower().endswith(".dds"):
+						normName = normName[:-4]
+
+					jobs[normName] = jobs.get(normName, False) or hasGlossMetal(normName, getattr(mat.material, "cls", None))
+
+			if jobs:
+				from concurrent.futures import ThreadPoolExecutor
+				workers = max(1, min(3, os.cpu_count() or 1))   # ~0.4 GB of arrays per 4096x4096 map in flight
+
+				with ThreadPoolExecutor(max_workers = workers) as pool:
+					list(pool.map(lambda kv: buildObjNormalMaps(path.join(outpath, "textures", f"{kv[0]}.dds"), kv[1]), jobs.items()))
+
+				_lap("normal + gloss/metal maps")
+		else:
+			for mat in SafeIter(self, self.__mats):
+				if mat.material.normal is not None:
+					normName = str(mat.material.normal).split("*")[0]
+					if normName.lower().endswith(".dds"):
+						normName = normName[:-4]
+					if OBJ_SRGB_PREENCODE:
+						decodeNormalForObjSrgb(path.join(outpath, "textures", f"{normName}.dds"))
+					elif OBJ_NORMAL_GLTF_PNG:
+						decodeNormalForGltf(path.join(outpath, "textures", f"{normName}.dds"))
+					else:
+						decodeNormalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+					_lap("normal maps")
+
+					if hasGlossMetal(normName, getattr(mat.material, "cls", None)):
+						decodeGlossMetalForObj(path.join(outpath, "textures", f"{normName}.dds"))
+						_lap("gloss/metal maps")
 
 		# Collect every distinct (diffuse, camo) pair used by the model's materials
 		pairs = {}
@@ -2195,6 +2132,8 @@ class MaterialTemplateLibrary(Terminable):
 
 		if not pairs:
 			log.log("Model does not use dynamic camo; skipping camouflage baking step.")
+			_lap("camo pairs")
+			_report()
 			log.subLevel()
 			return
 
@@ -2205,15 +2144,17 @@ class MaterialTemplateLibrary(Terminable):
 		except Exception as e:
 			print(f"[WARNING] Automated baking routine encountered an issue: {e}")
 
+		_lap("camo bake")
+		_report()
 		log.subLevel()
 
 def computeMaterialNames(mats:list[MaterialData], parent:Terminable = None):
 	log.log("Computing material names")
 	log.addLevel()
-
+	
 	enumerateIt = (lambda x: SafeEnumerate(parent, x)) if parent is not None else (lambda x: enumerate(x))
 	iterIt = (lambda x: SafeIter(parent, x)) if parent is not None else (lambda x: iter(x))
-
+	
 	for k, mat in enumerateIt(mats):
 		mat:MaterialData
 
@@ -2223,10 +2164,10 @@ def computeMaterialNames(mats:list[MaterialData], parent:Terminable = None):
 
 		for mat2 in iterIt(mats):
 			mat2:MaterialData
-
+			
 			if mat is mat2:
 				continue
-
+			
 			if mat.getName() == mat2.getName():
 				# MaterialData.__eq__ only compares the texture slots, so e.g. the canopy and the coloured lenses (all
 				# "dynamic_glass_chrome", no textures) counted as the same material and shared one name; Blender then merges
@@ -2243,13 +2184,13 @@ if __name__ == "__main__":
 	from gameres import GameResDesc
 
 	dxp = DDSxTexturePack2("C:\\Program Files (x86)\\Steam\\steamapps\\common\\War Thunder\\content\\base\\res\\cars_ri.dxp.bin")
-
+	
 	for ddsx in dxp.getAllDDSx():
 		if ddsx != False:
 			AssetCacher.cacheAsset(ddsx)
 
 	desc = GameResDesc("C:\\Program Files (x86)\\Steam\\steamapps\\common\\War Thunder\\content\\base\\res\\riDesc.bin")
-
+	
 	materials = desc.getModelMaterials("dodge_wf32")
 
 	mtl = MaterialTemplateLibrary(materials)

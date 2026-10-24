@@ -16,9 +16,12 @@ from struct import unpack, pack
 from parse.datablock import *
 from util.terminable import Packed, SafeRange, SafeIter, SafeEnumerate, Terminable
 from parse.mesh import MatVData, InstShaderMeshResource, ShaderMesh
-from parse.material import MaterialData, MaterialTemplateLibrary, textureBatch,  computeMaterialNames, TexturePathDict, swapVehicleTex, buildNetPaintedMasks, setNetPaintedMasks, writeBlenderShading
+from parse.material import MaterialData, MaterialTemplateLibrary,  computeMaterialNames, TexturePathDict, swapVehicleTex, buildNetPaintedMasks, setNetPaintedMasks, writeBlenderShading
 from abc import abstractmethod, ABC
 from math import sqrt
+import numpy as _np
+import time as _time
+import parse.mesh as _mesh
 
 
 PHYSMAT_TO_SURFACEPROP = {
@@ -698,9 +701,34 @@ class Model(Terminable):
 				(vertex[2] * self.__vertScale[2]) + self.__vertOffet[2],
 		 	  )
 
+	def __fastScale(self, verts):
+		# Same arithmetic as __scaleVertex (float64 multiply, then add) for a whole list at once. Only for plain float / int scale and
+		# offset (a numpy float32 would change the precision of the original) and an (N, 3) float64 vertex array; else None.
+		try:
+			s, o = self.__vertScale, self.__vertOffet
+
+			if type(verts) is not list or not verts:
+				return None
+
+			for x in (s[0], s[1], s[2], o[0], o[1], o[2]):
+				if type(x) is not float and type(x) is not int:
+					return None
+
+			a = _np.array(verts)
+
+			if a.dtype != _np.float64 or a.ndim != 2 or a.shape[1] != 3:
+				return None
+
+			r = a * _np.array((s[0], s[1], s[2]), dtype = _np.float64) + _np.array((o[0], o[1], o[2]), dtype = _np.float64)
+
+			return tuple(map(tuple, r.tolist()))
+		except Exception:
+			return None
+
 	def appendVerts(self, verts:Iterable[tuple[float, float, float]], UVs:Iterable[tuple[float, float]], scale:bool = True):
 		if scale:
-			verts = tuple(self.__scaleVertex(v) for v in verts)
+			fast = self.__fastScale(verts) if _mesh.FAST_DECODE else None
+			verts = fast if fast is not None else tuple(self.__scaleVertex(v) for v in verts)
 		
 		self.__vertices.extend(verts)
 		self.__uvs.extend(UVs)
@@ -818,7 +846,141 @@ class Model(Terminable):
 	
 	# Model export
 
+	def __objAside(self, why):
+		log.log(f"OBJ text: numpy path stepped aside ({why}), running the original loop")
+		return None
+
+	def __fastObj(self):
+		# Same text as the loop in getOBJ with the per-corner work (bone transform, face normal, normal sums) done by numpy. Every
+		# arithmetic step keeps the order of the original (the sums run in corner order), so the numbers are the same bits and the
+		# text is identical. Returns None, and the original loop runs, for anything unusual: odd types, ids out of range, a stop
+		# request, no geometry.
+		try:
+			if self.shouldTerminate:
+				return self.__objAside("stop requested")
+
+			nV = len(self.__vertices)
+			V = _np.array(self.__vertices)
+			U = _np.array(self.__uvs)
+
+			if nV == 0 or V.dtype != _np.float64 or V.shape != (nV, 3) or U.dtype != _np.float64 or U.ndim != 2 or U.shape[0] != nV or U.shape[1] < 2:
+				return self.__objAside("vertex / UV arrays are not float64 (n, 3) / (n, 2+)")
+
+			skeleton = self.__skeleton
+			idList, ptList, objs = [], [], []
+
+			for obj in self.__objects:
+				faces = obj.faces
+				nf = len(faces)
+
+				if nf == 0:
+					F = _np.empty((0, 3), dtype = _np.int64)
+				else:
+					F = _np.array(faces)
+
+					if F.dtype.kind not in "iu" or F.shape != (nf, 3):
+						return self.__objAside("faces are not an (n, 3) integer array")
+
+					F = F.astype(_np.int64)
+
+				flat = F.reshape(-1)
+
+				if flat.size and (flat.min() < 0 or flat.max() >= nV):
+					return self.__objAside("a vertex id is outside the vertex list")
+
+				P = V[flat]
+				node = skeleton.getNodeByName(obj.name) if skeleton is not None and not obj.skinned else None
+
+				if node is not None and flat.size:
+					M = _np.array(node.wtm)
+
+					if M.shape != (4, 4) or M.dtype not in (_np.float64, _np.int64):
+						return self.__objAside("a bone matrix is not 4x4 float64/int64")
+
+					M = M.astype(_np.float64)
+					Q = _np.empty_like(P)
+
+					# vectorTransform: 0 + m0*x + m1*y + m2*z, then + translation, in this order
+					for r in range(3):
+						acc = 0.0 + M[r, 0] * P[:, 0]
+						acc = acc + M[r, 1] * P[:, 1]
+						acc = acc + M[r, 2] * P[:, 2]
+						Q[:, r] = acc + M[r, 3]
+
+					P = Q
+
+				idList.append(flat)
+				ptList.append(P)
+				objs.append((obj.name, F, obj.materials))
+
+			allIds = _np.concatenate(idList)
+			allP = _np.concatenate(ptList)
+
+			objVerts = [""] * nV
+			objUVs = [""] * nV
+			objNormals = ["vn 0.0 0.0 0.0"] * nV
+
+			if allIds.size:
+				# face normals from the (x, y, -z) corners, like the loop; sums per vertex in corner order (bincount adds in input order)
+				C = allP.reshape(-1, 3, 3).copy()
+				C[:, :, 2] = -C[:, :, 2]
+				e1 = C[:, 1, :] - C[:, 0, :]
+				e2 = C[:, 2, :] - C[:, 0, :]
+				n0 = e1[:, 1] * e2[:, 2] - e1[:, 2] * e2[:, 1]
+				n1 = e1[:, 2] * e2[:, 0] - e1[:, 0] * e2[:, 2]
+				n2 = e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]
+				sx = _np.bincount(allIds, weights = _np.repeat(n0, 3), minlength = nV)
+				sy = _np.bincount(allIds, weights = _np.repeat(n1, 3), minlength = nV)
+				sz = _np.bincount(allIds, weights = _np.repeat(n2, 3), minlength = nV)
+
+				with _np.errstate(all = "ignore"):
+					length = _np.sqrt(sx * sx + sy * sy + sz * sz)
+					nz = length != 0.0
+					ox = _np.where(nz, sx / length, sx)
+					oy = _np.where(nz, sy / length, sy)
+					oz = _np.where(nz, sz / length, sz)
+
+				# a vertex is written once, from the first corner (object, face, corner order) that uses it
+				uniq, first = _np.unique(allIds, return_index = True)
+				pv = allP[first]
+				uv = U[uniq]
+
+				for vid, x, y, z, u, v, a, b, c in zip(uniq.tolist(), pv[:, 0].tolist(), pv[:, 1].tolist(), (-pv[:, 2]).tolist(),
+													   uv[:, 0].tolist(), uv[:, 1].tolist(), ox[uniq].tolist(), oy[uniq].tolist(), oz[uniq].tolist()):
+					objVerts[vid] = "v %.4f %.4f %.4f" % (x, y, z)
+					objUVs[vid] = "vt %.4f %.4f" % (u, v)
+					objNormals[vid] = "vn %.4f %.4f %.4f" % (a, b, c)
+
+			objFaces = []
+
+			for name, F, mats in objs:
+				objFaces.append(f"g {name}")
+
+				for i, (p, q, r) in enumerate((F + 1).tolist()):
+					if i in mats:
+						objFaces.append(f"usemtl {mats[i]}")
+
+					objFaces.append("f %d/%d/%d %d/%d/%d %d/%d/%d" % (p, p, p, q, q, q, r, r, r))
+
+			return Model.__join((
+				Model.__join(objVerts),
+				Model.__join(objUVs),
+				Model.__join(objNormals),
+				Model.__join(objFaces),
+			))
+		except Exception as e:
+			return self.__objAside(f"error {type(e).__name__}: {e}")
+
 	def getOBJ(self):
+		if _mesh.FAST_DECODE:
+			fast = self.__fastObj()
+
+			if fast is not None:
+				log.log("OBJ text: numpy path")
+				return fast
+		else:
+			log.log("OBJ text: original loop (fast export is off)")
+
 		objVerts = [""] * self.vertCnt
 		objUVs = [""] * self.vertCnt
 		objNormals = ["vn 0.0 0.0 0.0"] * self.vertCnt
@@ -1093,7 +1255,10 @@ class Model(Terminable):
 
 		fileName = f"{self.exportName}.obj"
 
+		_t0 = _time.perf_counter()
 		obj = self.getOBJ()
+		_tObj = _time.perf_counter() - _t0
+		_tTex = _tMtl = 0.0
 
 		if self.materials is not None:
 			log.log("Writing MTL")
@@ -1107,7 +1272,9 @@ class Model(Terminable):
 
 			if exportTexture:
 				# First run model-level texture extraction to catch all t0/t1/t2/camo slots
+				_t0 = _time.perf_counter()
 				self.exportTextures(output, exportTexture=True, forceConvert=forceConvert)
+				_tTex = _time.perf_counter() - _t0
 				# Net / cloth atlas: the texels only ordinary parts use are painted like any other camo (same pass the GLB export does)
 				try:
 					setNetPaintedMasks(buildNetPaintedMasks(self))
@@ -1116,10 +1283,12 @@ class Model(Terminable):
 					log.log(f"Net camo masks skipped ({type(e).__name__}: {e})", LOG_WARN)
 
 				# Then trigger mtl export routines (like baking/conversions)
+				_t0 = _time.perf_counter()
 				try:
 					mtl.exportTextures(output, forceConvert)
 				finally:
 					setNetPaintedMasks({})
+				_tMtl = _time.perf_counter() - _t0
 
 				# REMOVED (user: no longer used): the <name>_blender_shading.py helper written here next to the .obj.
 				# It called material.writeBlenderShading(output + "/" + self.exportName + "_blender_shading.py", self.materials)
@@ -1136,6 +1305,7 @@ class Model(Terminable):
 		log.subLevel()
 
 		log.log(f"Wrote {len(obj)} bytes to {fileName}")
+		log.log(f"OBJ export timing: OBJ text {_tObj:.1f} s | model textures {_tTex:.1f} s | MTL textures {_tMtl:.1f} s")
 	
 	def exportDmf(self, output:str = getcwd(), exportTexture:bool = True, forceConvert:bool = False):
 		log.log(f"Exporting {self.exportName} as DMF")
@@ -1184,47 +1354,45 @@ class Model(Terminable):
 
 			exported = set()
 
-			# [WTX patch] the textures are planned here (shared state, one thread) and written by a worker pool when the block ends
-			with textureBatch():
-				for mat in SafeIter(self, self.materials):
-					mat: MaterialData
+			for mat in SafeIter(self, self.materials):
+				mat: MaterialData
 
-					# Combine textures array with any t0, t1, t2 parameters
-					all_texs = list(mat.textures)
-					params = mat.getParams()
-					for key in ("t0", "t1", "t2", "camo_tex"):
-						val = swapVehicleTex(params.get(key))
-						if isinstance(val, str) and val and val not in all_texs:
-							all_texs.append(val)
+				# Combine textures array with any t0, t1, t2 parameters
+				all_texs = list(mat.textures)
+				params = mat.getParams()
+				for key in ("t0", "t1", "t2", "camo_tex"):
+					val = swapVehicleTex(params.get(key))
+					if isinstance(val, str) and val and val not in all_texs:
+						all_texs.append(val)
 
-					for tex in SafeIter(self, all_texs):
-						if mat.skipsCamoTexture(tex):       # skin preview: the skin replaces this diffuse, its camo is not needed
+				for tex in SafeIter(self, all_texs):
+					if mat.skipsCamoTexture(tex):       # skin preview: the skin replaces this diffuse, its camo is not needed
+						continue
+
+					for i in SafeRange(self, 2):
+						if i == 0:
+							texN = mat.checkModifiedName(
+								MaterialData.getTexFileName(tex), texturePaths
+							)
+							if texN == tex:
+								continue
+						else:
+							texN = None
+
+						# Same output file whether it is asked for as 'name' (pass 0) or 'name*' (pass 1) unless a modified variant ('namem') exists,
+						# so key on the file name; before, pass 1 never matched pass 0 and every texture was converted and written twice.
+						key = texN or MaterialData.getTexFileName(tex)
+
+						if key in exported:
 							continue
 
-						for i in SafeRange(self, 2):
-							if i == 0:
-								texN = mat.checkModifiedName(
-									MaterialData.getTexFileName(tex), texturePaths
-								)
-								if texN == tex:
-									continue
-							else:
-								texN = None
+						exported.add(key)
 
-							# Same output file whether it is asked for as 'name' (pass 0) or 'name*' (pass 1) unless a modified variant ('namem') exists,
-							# so key on the file name; before, pass 1 never matched pass 0 and every texture was converted and written twice.
-							key = texN or MaterialData.getTexFileName(tex)
-
-							if key in exported:
-								continue
-
-							exported.add(key)
-
-							self.setSubTask(mat)
-							mat.exportTexture(
-								tex, output, forceConvert, texturePaths, texN
-							)
-							self.clearSubTask()
+						self.setSubTask(mat)
+						mat.exportTexture(
+							tex, output, forceConvert, texturePaths, texN
+						)
+						self.clearSubTask()
 
 			log.subLevel()
 	
@@ -1859,7 +2027,12 @@ class RendInst(RealResData, ModelContainer):
 				curFace = elem.startI // 3
 
 				obj.appendMaterial(mdl.getMaterialName(elem.mat), None, elem.mat)
-				
+
+				if _mesh.FAST_DECODE and 0 <= curFace and curFace + elem.numFace <= len(faces) and type(obj.faces) is list and not self.shouldTerminate:
+					o = indiceOffset
+					obj.faces.extend([(a + o, b + o, c + o) for a, b, c in faces[curFace:curFace + elem.numFace]])
+					continue
+
 				for i in SafeRange(self, curFace, curFace + elem.numFace):
 					obj.appendFace(tuple(f + indiceOffset for f in faces[i]))
 		

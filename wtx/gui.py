@@ -74,12 +74,12 @@ from PySide6.QtWidgets import (
 
 import util.log as dae_log
 from vehicle_core.VehicleLook import auto_find_wt_path
-from wtx import ROOT, tuning
+from wtx import ROOT
 from wtx.fonts import ensure_game_font, name_symbol_report, register_symbol_font, symbols_first
 from wtx.assets import AssetLibrary, AssetRef
 from vehicle_core.Loadout import LoadoutData
 from wtx.loadout_panel import LoadoutPanel
-from wtx.settings_dialog import SettingsDialog
+from wtx.settings_dialog import SettingsDialog, apply_fast_export, fast_export_default
 from wtx.theme import QSS
 from wtx.vehicles import (
     VEHICLE_TYPES,
@@ -493,7 +493,6 @@ class MainWindow(QMainWindow):
     self._loadout: LoadoutData | None = None      # weapon slots of the selected vehicle (None = it has none)
     self._selection: dict[int, str] = {}          # slot index -> preset name; empty = bare jet
     self.game_dir = ""                            # edited in Settings
-    self.tuning = tuning.defaults()               # Settings > Performance: worker threads, pack cache, profiling (wtx/tuning.py)
     self.out_dir = ""
     self.all_armament = False                     # Settings: Export Armament takes every weapon of the vehicle
     self._status_ctx = ""                         # vehicle / weapon being exported, shown after the phase text
@@ -719,40 +718,6 @@ class MainWindow(QMainWindow):
       bt.setEnabled(False)
     self.btn_weapon.setMinimumWidth(150)
     self.btn_vehicle.setMinimumWidth(130)
-    # ===== TEX_DUMP BUTTON (temporary): delete this block and wtx/tex_dump.py to remove the feature =====
-    self.btn_texdump = QPushButton("Extract textures only")
-    self.btn_texdump.setToolTip("Write only the textures this vehicle's model uses (.dds + .png + textures.txt) into a 'textures_<id>' folder.")
-    self.btn_texdump.setMinimumHeight(34)
-
-    def _texdump_click():
-      veh, lib = self.current, self.library
-      if not veh or not lib:
-        self._say("Select a vehicle first (and wait for the asset library).")
-        return
-      out = self._out_dir()
-      if not out:
-        return
-      refs = lib.find_vehicle_models(veh.id, veh.model_id)
-      ref = refs[0] if refs else self._pick_asset(f"vehicle:{veh.id}", f"Pick the 3D model for {veh.name}", veh.model_id)
-      if not ref:
-        return
-      dest = self._vehicle_dir(veh, out) / f"textures_{safe_name(veh.id)}"
-      say = self._say
-      self._begin_status(veh.name, "Extracting textures of")
-
-      def work():
-        from wtx.tex_dump import dump_vehicle_textures
-        return dump_vehicle_textures(lib, ref, dest, say)
-
-      def ok(n):
-        say(f"=== Done: {n} texture(s) in {dest} ===")
-        self._finish_status(f"{veh.name}: {n} texture(s) extracted")
-
-      self._run(work, ok, "Extracting textures")
-
-    self.btn_texdump.clicked.connect(_texdump_click)
-    row1.addWidget(self.btn_texdump)
-    # ===== END TEX_DUMP BUTTON =====
     row1.addWidget(self.btn_preview)
     row1.addWidget(self.btn_skin)
     row1.addWidget(self.btn_vehicle)
@@ -887,9 +852,9 @@ class MainWindow(QMainWindow):
       game = str(found) if found else ""
     self.game_dir = game
     self.all_armament = s.value("all_armament", False, type=bool)
+    self.fast_export = s.value("fast_export", fast_export_default(), type=bool)
+    apply_fast_export(self.fast_export)
     self.grp_loadout.set_use_icons(s.value("loadout_icons", True, type=bool))
-    self.tuning = tuning.load(s)
-    tuning.apply(self.tuning)
     fmt = str(s.value("export_format", "OBJ"))
     self.combo_format.setCurrentIndex(max(0, self.combo_format.findText(fmt)))
     self.chk_tex.setChecked(s.value("opt_tex", True, type=bool))
@@ -909,20 +874,23 @@ class MainWindow(QMainWindow):
 
   def _open_settings(self):
     dlg = SettingsDialog(self, self.game_dir, self.out_dir, self.all_armament, self.grp_loadout.use_icons,
-                         tuning=self.tuning)
+                         fast_export=getattr(self, "fast_export", True))
     if dlg.exec() != QDialog.DialogCode.Accepted:
       return
     old_game = self.game_dir
     self.game_dir, self.out_dir = dlg.game_dir(), dlg.out_dir()
     self.all_armament = dlg.all_armament()
     self.grp_loadout.set_use_icons(dlg.loadout_icons())
+    if dlg.fast_export() != getattr(self, "fast_export", True):
+      self._say("Fast export (experimental): " + ("on" if dlg.fast_export() else "off") + " - applies to the next export.")
+    self.fast_export = dlg.fast_export()
+    apply_fast_export(self.fast_export)
     s = self.settings
     s.setValue("game_dir", self.game_dir)
     s.setValue("out_dir", self.out_dir)
     s.setValue("all_armament", self.all_armament)
+    s.setValue("fast_export", self.fast_export)
     s.setValue("loadout_icons", dlg.loadout_icons())
-    self.tuning = tuning.apply(dlg.tuning())
-    tuning.save(s, self.tuning)
     self._update_buttons()
     if dlg.reload_mode:
       self._start_loading(use_cache=dlg.reload_mode != "clear")
@@ -1643,4 +1611,4 @@ def run() -> int:
   sys.stderr = TeeStream(bridge, sys.__stderr__, 2)
   win = MainWindow(bridge)
   win.show()
-  return app.exec()
+  return app.exec()

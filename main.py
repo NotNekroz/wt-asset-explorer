@@ -11,6 +11,19 @@ import re
 from pathlib import Path
 import traceback
 
+# Windowed build: every console child process (texconv.exe, wt_ext_cli.exe) would flash a cmd window.
+# Patch subprocess.Popen once so every call site (subprocess.run included) starts them hidden.
+if sys.platform == "win32":
+  import subprocess as _subprocess
+  _OrigPopen = _subprocess.Popen
+
+  class _NoWindowPopen(_OrigPopen):
+    def __init__(self, *args, **kwargs):
+      kwargs["creationflags"] = kwargs.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
+      super().__init__(*args, **kwargs)
+
+  _subprocess.Popen = _NoWindowPopen
+
 # 1. IMPORT PYSIDE6 FIRST (Prevents native DLL initialization crashes)
 try:
     from PySide6.QtCore import QCoreApplication, QStandardPaths
@@ -52,14 +65,6 @@ except Exception as e:
     print(f"[CRITICAL ERROR DURING WTX IMPORTS]: {e}")
     traceback.print_exc()
     sys.exit(1)
-
-# --- PHASE TIMING (temporary, removable: delete this block and phase_timing.py; WTX_TIMING=0 turns it off) ---
-try:
-    import phase_timing
-    print(phase_timing.install())
-except Exception as _timing_error:
-    print(f"[timing] not installed: {_timing_error}")
-# --- end PHASE TIMING ---
 
 
 def parse_vehicle_queries_from_file(file_path: Path) -> list[str]:

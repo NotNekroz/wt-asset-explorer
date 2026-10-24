@@ -10,6 +10,12 @@ from util.terminable import SafeRange, Terminable, FilePathable, SafeIter, SafeE
 from util.enums import *
 from parse.material import MaterialData
 from abc import ABC, abstractmethod
+import os as _os
+import numpy as _np
+
+# Vectorised vertex / index-buffer decoding. Same results as the per-item loops below (they stay as the fallback and are
+# used for anything unusual). WTX_FAST_MATH=0 switches it off.
+FAST_DECODE = _os.environ.get("WTX_FAST_MATH", "1") != "0"
 
 
 class ShaderMesh(Terminable):
@@ -603,6 +609,138 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 			else:
 				return None
 
+		# ---- fast paths (numpy). Each returns None when it is not sure it can reproduce the loop exactly; the caller then runs
+		# ---- the original loop. The names end in "__" so Python does not name-mangle them.
+		def __fastVertices__(self, file:BinBlock, parser, vCnt:int):
+			try:
+				with _np.errstate(all = "ignore"):
+					return self.__fastVerticesImpl__(file, parser, vCnt)
+			except Exception:
+				return None
+
+		def __fastVerticesImpl__(self, file:BinBlock, parser, vCnt:int):
+			VD = MatVData.VertexData
+
+			if vCnt <= 0 or self.shouldTerminate:
+				return None
+
+			sizes = {VD.SHORT_VERTEX: 6, VD.FLOAT_VERTEX: 12, VD.NO_UV: 0, VD.SHORT_UV: 4, VD.FLOAT_UV: 8, VD.DUAL_SHORT_UV: 8, VD.HALFFLOAT_UV: 4}
+			vert = uv = None
+			ofs = 0
+
+			for c in parser:
+				t = type(c)
+
+				if t is VD.PADDING:
+					if type(c.sz) is not int or c.sz < 0:
+						return None
+					ofs += c.sz
+				elif t is VD.SHORT_VERTEX or t is VD.FLOAT_VERTEX:
+					if vert is not None:
+						return None
+					vert = (t, ofs)
+					ofs += sizes[t]
+				elif t in sizes:
+					if uv is not None:
+						return None
+					uv = (t, ofs)
+					ofs += sizes[t]
+				else:
+					return None
+
+			if vert is None or uv is None:
+				return None
+
+			row = ofs
+			need = vCnt * row
+
+			if file.getSize() - file.tell() < need:
+				return None
+
+			start = file.getAbsOffset() + file.tell()
+			raw = file.getData()[start:start + need]
+
+			if len(raw) != need:
+				return None
+
+			rows = _np.frombuffer(raw, dtype = _np.uint8).reshape(vCnt, row)
+
+			def field(dt, ofs, n):
+				w = _np.dtype(dt).itemsize * n
+				return _np.ascontiguousarray(rows[:, ofs:ofs + w]).view(dt).reshape(vCnt, n)
+
+			if vert[0] is VD.SHORT_VERTEX:
+				verts = (field("<i2", vert[1], 3).astype(_np.float64) / 32768).tolist()
+			else:
+				verts = field("<f4", vert[1], 3).astype(_np.float64).tolist()
+
+			ut, uo = uv
+			UVs1 = [None] * vCnt
+
+			if ut is VD.NO_UV:
+				UVs0 = [(0, 0)] * vCnt
+			elif ut is VD.SHORT_UV:
+				a = field("<i2", uo, 2).astype(_np.float64)
+				UVs0 = list(zip((a[:, 0] / 4096).tolist(), (1 + (-a[:, 1] / 4096)).tolist()))
+			elif ut is VD.DUAL_SHORT_UV:
+				a = field("<i2", uo, 4).astype(_np.float64)
+				UVs0 = list(zip((a[:, 0] / 4096).tolist(), (1 + (-a[:, 1] / 4096)).tolist()))
+				UVs1 = list(zip((a[:, 2] / 4096).tolist(), (1 + (-a[:, 3] / 4096)).tolist()))
+			else:
+				a = field("<f4" if ut is VD.FLOAT_UV else "<f2", uo, 2).astype(_np.float64)
+				UVs0 = list(zip(a[:, 0].tolist(), (-a[:, 1]).tolist()))
+
+			file.seek(need, 1)
+
+			return verts, UVs0, UVs1
+
+		def __fastUnpackedFaces__(self, file:BinBlock, count:int):
+			try:
+				if count <= 0 or self.shouldTerminate or file.getSize() - file.tell() < count * 6:
+					return None
+
+				a = _np.frombuffer(file.read(count * 6), dtype = "<u2").reshape(count, 3)
+
+				return tuple(map(tuple, a.tolist()))
+			except Exception:
+				return None
+
+		def __fastPackedFaces__(self, data:bytes, size:int):
+			try:
+				if size <= 0 or len(data) != size or self.shouldTerminate:
+					return None
+
+				b = _np.frombuffer(data, dtype = _np.uint8)
+
+				if b[-1] >= 0x80:      # an unfinished number at the end: the loop raises there, let it
+					return None
+
+				ends = _np.flatnonzero(b < 0x80)
+				starts = _np.concatenate(([0], ends[:-1] + 1))
+				lens = ends - starts + 1
+
+				if lens.max() > 5:     # the loop stops a number after 5 bytes and carries on inside it; not reproduced here
+					return None
+
+				pos = _np.arange(len(b)) - _np.repeat(starts, lens)
+				vals = _np.add.reduceat((b & 0x7f).astype(_np.int64) << (7 * pos), starts)
+
+				n = (len(vals) // 3) * 3
+				vals = vals[:n]       # a last incomplete triple is dropped, like the loop does
+
+				stream = vals & 1
+				delta = vals >> 2
+				delta = _np.where((vals & 2) != 0, ~delta, delta)
+				idx = _np.zeros(n, dtype = _np.int64)
+
+				for s in (0, 1):
+					m = stream == s
+					idx[m] = _np.cumsum(delta[m])
+
+				return tuple(map(tuple, idx.reshape(-1, 3)[:, (0, 2, 1)].tolist()))     # (a, c, b) like the loop
+			except Exception:
+				return None
+
 		def __processVertices__(self, file:BinBlock):
 				format = self.__gvData.getStorageFormat()
 				vStride = self.__gvData.getVertexStride()
@@ -628,7 +766,12 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 				else:
 					log.log(f"Processing {vCnt} vertices vFormat={format} vStride={vStride}")
 
-					for i in SafeRange(self, vCnt):
+					fast = self.__fastVertices__(file, parser, vCnt) if FAST_DECODE else None
+
+					if fast is not None:
+						verts, UVs0, UVs1 = fast
+
+					for i in (SafeRange(self, vCnt) if fast is None else ()):
 						for parseClass in SafeIter(self, parser):
 							parseClass:MatVData.VertexData.PARSECLASS
 
@@ -669,7 +812,10 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 
 				count = (sz // 6)  - sz % 6
 
-				faces = tuple(unpack("HHH", file.read(6)) for i in SafeRange(self, count))
+				faces = self.__fastUnpackedFaces__(file, count) if FAST_DECODE else None
+
+				if faces is None:
+					faces = tuple(unpack("HHH", file.read(6)) for i in SafeRange(self, count))
 
 			else:
 				log.log("Processing packed faces")
@@ -677,7 +823,11 @@ class MatVData(Terminable, FilePathable): # stores material and vertex data :D
 				file.seek(1, 1)
 				
 				encodedSize = pSz - 0x5
-				faces = tuple(f for f in self.__decodeIndexSequence__(file.read(encodedSize), encodedSize, self))
+				encoded = file.read(encodedSize)
+				faces = self.__fastPackedFaces__(encoded, encodedSize) if FAST_DECODE else None
+
+				if faces is None:
+					faces = tuple(f for f in self.__decodeIndexSequence__(encoded, encodedSize, self))
 
 			log.log(f"Processed {len(faces)} faces")
 			log.subLevel()

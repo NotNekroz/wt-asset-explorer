@@ -4,19 +4,33 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout,
+    QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
 )
 
-from wtx import tuning as _tuning
+
+def fast_export_default() -> bool:
+    """Fast export is on by default; the Settings checkbox is the switch (it also sets WTX_FAST_MATH for the modules)."""
+    return True
+
+
+def apply_fast_export(on: bool) -> None:
+    """Switch the fast paths of the export code: vertex / face decoding, vertex scaling, face copy, GLB animation maths and
+    the OBJ writer. Modules that are already loaded change at once; the ones loaded later read the environment variable."""
+    import os
+    import sys
+    os.environ["WTX_FAST_MATH"] = "1" if on else "0"
+    for module, flag in (("parse.mesh", "FAST_DECODE"), ("parse.a2d_anim", "FAST_MATH")):
+        mod = sys.modules.get(module)
+        if mod is not None:
+            setattr(mod, flag, bool(on))
 
 
 class SettingsDialog(QDialog):
     """Paths, reload / cache and a few export / display options. The caller reads the values after exec()."""
 
     def __init__(self, parent, game_dir: str, out_dir: str, all_armament: bool, loadout_icons: bool,
-                 tuning: dict | None = None):
+                 fast_export: bool = True):
         super().__init__(parent)
-        tune = _tuning.normalize(tuning)             # None = the starting values (environment variables / built-in defaults)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(640)
         self.reload_mode: str | None = None          # "cache" / "clear" when a reload button closed the dialog
@@ -61,50 +75,20 @@ class SettingsDialog(QDialog):
         self.chk_all = QCheckBox("[ Export Armament ] exports every weapon of the vehicle (ignores the weapon dropdown)")
         self.chk_all.setChecked(bool(all_armament))
         lay.addWidget(self.chk_all)
+        self.chk_fast = QCheckBox("[ Experimental ] Fast export: quicker decoding, animation maths and OBJ writing "
+                                  "(same files; turn it off if an export looks wrong)")
+        self.chk_fast.setToolTip("Applies to GLB and OBJ exports. Vertex / face decoding, vertex scaling and the OBJ text are\n"
+                                 "computed with numpy instead of per-vertex Python loops; the GLB animation is decoded once.\n"
+                                 "The output is checked to be identical (tests/test_fast_decode.py). Texture conversion is not affected.\n"
+                                 "Takes effect on the next export.")
+        self.chk_fast.setChecked(bool(fast_export))
+        lay.addWidget(self.chk_fast)
 
         lay.addSpacing(8)
         lay.addWidget(self._heading("Display"))
         self.chk_icons = QCheckBox("Show weapon icons in the loadout slots (off = weapon names)")
         self.chk_icons.setChecked(bool(loadout_icons))
         lay.addWidget(self.chk_icons)
-
-        lay.addSpacing(8)
-        lay.addWidget(self._heading("Performance"))
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Texture workers"))
-        self.spin_tex = QSpinBox()
-        self.spin_tex.setRange(0, _tuning.TEX_WORKERS_MAX)
-        self.spin_tex.setValue(tune["tex_workers"])
-        self.spin_tex.setToolTip("Threads that convert and write textures at the end of an export stage. 0 or 1 = no pool (one after the other).")
-        row.addWidget(self.spin_tex)
-        row.addSpacing(16)
-        row.addWidget(QLabel("Pack workers"))
-        self.spin_pack = QSpinBox()
-        self.spin_pack.setRange(0, _tuning.PACK_WORKERS_MAX)
-        self.spin_pack.setValue(tune["pack_workers"])
-        self.spin_pack.setToolTip("Threads that parse texture packs which are not in the pack cache yet. 0 or 1 = one after the other.")
-        row.addWidget(self.spin_pack)
-        row.addSpacing(16)
-        row.addWidget(QLabel("glTF map workers"))
-        self.spin_map = QSpinBox()
-        self.spin_map.setRange(0, _tuning.MAP_WORKERS_MAX)
-        self.spin_map.setValue(tune["map_workers"])
-        self.spin_map.setToolTip("Threads that build the glTF normal and metal-roughness pictures before the materials are written. "
-                                 "0 or 1 = one after the other. Each thread holds a few copies of a texture in memory at a time.")
-        row.addWidget(self.spin_map)
-        row.addStretch(1)
-        lay.addLayout(row)
-        self.chk_clear_packs = QCheckBox("Start every export with an empty texture-pack cache (for fair comparisons)")
-        self.chk_clear_packs.setChecked(tune["clear_pack_cache"])
-        self.chk_clear_packs.setToolTip("Every export parses its texture packs again. The operating system's file cache cannot be cleared, "
-                                        "so the first run after a boot is still colder than the following ones.")
-        lay.addWidget(self.chk_clear_packs)
-        self.chk_profile = QCheckBox("Profile the slow phases (adds a function-level report after the [timing] table; slows those phases down)")
-        self.chk_profile.setChecked(tune["profile"])
-        lay.addWidget(self.chk_profile)
-        note = QLabel("Applied immediately, no restart needed. The [timing] report starts with a line that shows these values.")
-        note.setWordWrap(True)
-        lay.addWidget(note)
 
         lay.addSpacing(10)
         row = QHBoxLayout()
@@ -154,11 +138,5 @@ class SettingsDialog(QDialog):
     def loadout_icons(self) -> bool:
         return self.chk_icons.isChecked()
 
-    def tuning(self) -> dict:
-        return _tuning.normalize({
-            "tex_workers": self.spin_tex.value(),
-            "pack_workers": self.spin_pack.value(),
-            "map_workers": self.spin_map.value(),
-            "clear_pack_cache": self.chk_clear_packs.isChecked(),
-            "profile": self.chk_profile.isChecked(),
-        })
+    def fast_export(self) -> bool:
+        return self.chk_fast.isChecked()

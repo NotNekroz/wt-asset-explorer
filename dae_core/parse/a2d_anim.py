@@ -16,6 +16,7 @@ Conventions (checked against the exported GLB, every one of the 312 bones matche
 from __future__ import annotations
 
 import json
+import os
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,10 @@ TIME_OFFSET_FRAMES = 1
 # True: the full, unsplit clip is written as well (it is the original export and plays everything at once; costs
 # about the size of the a2d again). False: only the named clips.
 KEEP_FULL_CLIP = True
+
+# Whole-track maths instead of one tiny numpy call per bone and frame, and one ACL decode per a2d instead of two.
+# Same result up to float rounding in the last bits of float64 (the glTF stores float32). WTX_FAST_MATH=0 switches it off.
+FAST_MATH = os.environ.get("WTX_FAST_MATH", "1") != "0"
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -130,6 +135,80 @@ def _decompose(q, s):
     return _mat_to_quat(R), np.array(sc)
 
 
+def _decompose_batch(Q, S):
+    """_decompose() for all frames of one track at once. Q (n, 4) xyzw, S (n, 3) -> (quats (n, 4) float64, scales (n, 3))"""
+    Q = np.asarray(Q)
+    x, y, z, w = Q[:, 0], Q[:, 1], Q[:, 2], Q[:, 3]
+    n = len(Q)
+    M = np.empty((n, 3, 3), Q.dtype)                       # in the quaternion's own dtype, like _quat_to_mat
+    M[:, 0, 0] = 1 - 2*(y*y + z*z); M[:, 0, 1] = 2*(x*y - z*w); M[:, 0, 2] = 2*(x*z + y*w)
+    M[:, 1, 0] = 2*(x*y + z*w); M[:, 1, 1] = 1 - 2*(x*x + z*z); M[:, 1, 2] = 2*(y*z - x*w)
+    M[:, 2, 0] = 2*(x*z - y*w); M[:, 2, 1] = 2*(y*z + x*w); M[:, 2, 2] = 1 - 2*(x*x + y*y)
+    M = M * np.asarray(S, float)[:, None, :]
+    sc = np.linalg.norm(M, axis=1)                         # column norms, (n, 3)
+    R = M / np.where(sc > 1e-6, sc, 1.0)[:, None, :]
+    neg = np.linalg.det(R) < 0
+    R[neg, :, 0] *= -1
+    sc[neg, 0] *= -1
+    with np.errstate(all="ignore"):
+        r00, r01, r02 = R[:, 0, 0], R[:, 0, 1], R[:, 0, 2]
+        r10, r11, r12 = R[:, 1, 0], R[:, 1, 1], R[:, 1, 2]
+        r20, r21, r22 = R[:, 2, 0], R[:, 2, 1], R[:, 2, 2]
+        t = r00 + r11 + r22
+        s0 = np.sqrt(t + 1) * 2
+        q0 = np.stack([(r21 - r12) / s0, (r02 - r20) / s0, (r10 - r01) / s0, .25 * s0], 1)
+        s1 = np.sqrt(1 + r00 - r11 - r22) * 2
+        q1 = np.stack([.25 * s1, (r01 + r10) / s1, (r02 + r20) / s1, (r21 - r12) / s1], 1)
+        s2 = np.sqrt(1 + r11 - r00 - r22) * 2
+        q2 = np.stack([(r01 + r10) / s2, .25 * s2, (r12 + r21) / s2, (r02 - r20) / s2], 1)
+        s3 = np.sqrt(1 + r22 - r00 - r11) * 2
+        q3 = np.stack([(r02 + r20) / s3, (r12 + r21) / s3, .25 * s3, (r10 - r01) / s3], 1)
+        c0 = t > 0
+        c1 = (r00 > r11) & (r00 > r22)
+        c2 = r11 > r22
+        q = np.select([c0[:, None], c1[:, None], c2[:, None]], [q0, q1, q2], q3)
+        q = q / np.linalg.norm(q, axis=1)[:, None]
+    return q, sc
+
+
+def _one_hemisphere(q):
+    """Same sign choice as the frame-by-frame loop (each key against the already flipped previous one), without the loop.
+    None when two neighbouring keys are (almost) perpendicular: there the loop's choice hangs on a rounding error."""
+    if len(q) < 2:
+        return q.copy()
+    d = np.einsum("ij,ij->i", q[1:], q[:-1])
+    if (np.abs(d) < 1e-9).any():
+        return None
+    sign = np.concatenate(([1.0], np.cumprod(np.where(d < 0, -1.0, 1.0))))
+    return q * sign[:, None]
+
+
+def _track_trs(R, S, nf, cache=None, key=None):
+    """(quat (nf, 4), scale (nf, 3)) of one track the way gltf_conv writes node TRS. Cached per key: the full clip and the
+    named clips ask for the same tracks again."""
+    if cache is not None and key in cache:
+        return cache[key]
+    res = None
+    if FAST_MATH:
+        try:
+            q, s = _decompose_batch(R, S)
+            q = _one_hemisphere(q)
+            if q is not None:
+                res = (q, s)
+        except Exception:
+            res = None
+    if res is None:
+        dec = [_decompose(R[f], S[f]) for f in range(nf)]
+        q = np.array([d[0] for d in dec]); s = np.array([d[1] for d in dec])
+        for f in range(1, nf):                       # one hemisphere -> shortest-path slerp
+            if np.dot(q[f], q[f - 1]) < 0:
+                q[f] = -q[f]
+        res = (q, s)
+    elif cache is not None:
+        cache[key] = res
+    return res
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # GLB
 # ----------------------------------------------------------------------------------------------------------------
@@ -201,11 +280,7 @@ def add_animation(js: dict, binb: bytearray, a2d: A2d, name: str, say: Say = pri
             continue
         if t_acc is None:
             t_acc = add_acc(times, "SCALAR")
-        dec = [_decompose(R[f], S[f]) for f in range(nf)]
-        q = np.array([d[0] for d in dec]); s = np.array([d[1] for d in dec])
-        for f in range(1, nf):                       # one hemisphere -> shortest-path slerp
-            if np.dot(q[f], q[f - 1]) < 0:
-                q[f] = -q[f]
+        q, s = _track_trs(R, S, nf, tr.setdefault("_trs_cache", {}) if FAST_MATH else None, (k, f0, f1))
         for flag, path, arr, typ in ((anim[0], "rotation", q, "VEC4"), (anim[1], "translation", T, "VEC3"),
                                      (anim[2], "scale", s, "VEC3")):
             if flag or not only_animated:
@@ -225,12 +300,13 @@ def add_animation(js: dict, binb: bytearray, a2d: A2d, name: str, say: Say = pri
 
 
 def add_named_clips(js: dict, binb: bytearray, a2d: A2d, graph: dict, res_name: str, say: Say = print,
-                    suffix: str = "") -> int:
+                    suffix: str = "", decoded: Optional[dict] = None) -> int:
     """Split `a2d` into one animation per mechanism of the animtree `graph` (anm_graph.extract output).
     Returns the number of clips written. Clip names: 'gear', 'flaps', 'hook', ... (+ suffix when several a2d)."""
     groups = anm_clips.build_groups(graph)
     hits, unclaimed = anm_clips.match_tracks(groups, a2d.track_names)
-    decoded = acl_decode(a2d.acl_blob)
+    if decoded is None:
+        decoded = acl_decode(a2d.acl_blob)
     written = 0
     for gname, tracks in hits.items():
         g = groups[gname]
@@ -252,12 +328,13 @@ def add_a2d_to_glb(glb_path, resources, say: Say = print, graph: Optional[dict] 
     for name, raw in resources:
         try:
             a2d = parse_container(unwrap(raw))
+            decoded = acl_decode(a2d.acl_blob) if FAST_MATH else None     # once for the full clip and the named clips
             if graph is None or KEEP_FULL_CLIP:
-                if add_animation(js, binb, a2d, name, say):
+                if add_animation(js, binb, a2d, name, say, decoded=decoded):
                     added += 1
             if graph is not None:
                 suffix = f"@{name}" if len(resources) > 1 else ""
-                added += add_named_clips(js, binb, a2d, graph, name, say, suffix)
+                added += add_named_clips(js, binb, a2d, graph, name, say, suffix, decoded=decoded)
         except Exception as e:                       # one bad clip must not lose the model
             say(f"  [WARNING] a2d '{name}' skipped: {type(e).__name__}: {e}")
     if added:
